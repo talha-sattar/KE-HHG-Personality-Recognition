@@ -1,0 +1,7 @@
+data/raw/
+data/processed/
+data/assets/entity2vec.bern
+*.csv
+*.bern
+outputs/
+artifacts/
