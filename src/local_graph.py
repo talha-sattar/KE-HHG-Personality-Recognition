@@ -247,7 +247,7 @@ class LocalGraphBuilder:
         self.word_id2_list = _load_word_id2_list(self.outp)
 
         # Empath mapping: token -> [cats] where cats may be names ("family") or ids
-        self.liwc_token2cats: Dict[str, List[Any]] = _load_json(self.outp / "liwc_word2cats.json")
+        self.liwc_token2cats: Dict[str, List[Any]] = _load_json(self.outp / "empath_word2cats.json")
 
         # Empath id2 list for name->id mapping (optional but needed when cats are names)
         self.liwc_name2id: Optional[Dict[str, int]] = None
@@ -418,7 +418,7 @@ def build_X_local_from_Hviews(
     H_text = H_views["H_text"]
 
     d = H_word.shape[1]
-    X = torch.zeros((len(nodes), d), dtype=H_word.dtype)
+    X = torch.zeros((len(nodes), d), dtype=H_word.dtype, device=H_word.device)
 
     # Safety check
     if not (0 <= doc_idx < H_text.shape[0]):

@@ -327,7 +327,7 @@ def precompute_gid2desc_embeddings(gid2desc: Dict[int,str], *, batch_size:int, d
     np.save(emb_path, embs); gids_path.write_text(json.dumps(gid_order), encoding="utf-8")
     gid2row={g:i for i,g in enumerate(gid_order)}
     emb=np.load(emb_path, mmap_mode="r")
-    print(f"[cache] saved → {emb_path}")
+    print(f"[cache] saved - {emb_path}")
     return emb, gid_order, gid2row, cache_dir
 
 _last_ctx_text=None

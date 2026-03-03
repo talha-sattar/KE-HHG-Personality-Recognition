@@ -20,11 +20,12 @@ This script:
   - user self-attention parameters (Wq/Wk/Wv)
   - classifier parameters
 - Uses 2 LR groups (local faster than global)
-- Prints global grad norm occasionally to prove trainability
+- Logs rich training/validation metrics
 """
 
 from __future__ import annotations
 
+import collections
 import csv
 import json
 import pickle
@@ -196,22 +197,30 @@ def _load_feature(path: Path) -> torch.Tensor:
     return torch.tensor(arr, dtype=torch.float32)
 
 
-def load_step2_inputs_liwc(out_dir: Union[str, Path]) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, int]]:
+def load_step2_inputs_liwc(
+    out_dir: Union[str, Path]
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, int]]:
     p = Path(out_dir)
-    adj_paths = {
-        "word": p / "adj_word.pkl",
-        "pos": p / "adj_tag.pkl",
-        "liwc": p / "adj_liwc.pkl",
-        "entity": p / "adj_entity.pkl",
-        "text": p / "adj_text.pkl",
-    }
-    feat_paths = {
-        "word": p / "word_type_bert_emb.pkl",
-        "pos": p / "pos_onehot.pkl",
-        "liwc": p / "liwc_onehot.pkl",
-        "entity": p / "entity_emb.pkl",
-        "text": p / "doc_bert_emb.npy",
-    }
+    adj_paths: Dict[str, Path] = {}
+    feat_paths: Dict[str, Path] = {}
+
+    adj_paths["word"] = p / "adj_word.pkl"
+    adj_paths["pos"] = p / "adj_tag.pkl"
+    liwc_adj_path = p / "adj_liwc.pkl"
+    if not liwc_adj_path.exists():
+        liwc_adj_path = p / "adj_empath.pkl"
+    adj_paths["liwc"] = liwc_adj_path
+    adj_paths["entity"] = p / "adj_entity.pkl"
+    adj_paths["text"] = p / "adj_text.pkl"
+
+    feat_paths["word"] = p / "word_type_bert_emb.pkl"
+    feat_paths["pos"] = p / "pos_onehot.pkl"
+    liwc_feat_path = p / "liwc_onehot.pkl"
+    if not liwc_feat_path.exists():
+        liwc_feat_path = p / "empath_onehot.pkl"
+    feat_paths["liwc"] = liwc_feat_path
+    feat_paths["entity"] = p / "entity_emb.pkl"
+    feat_paths["text"] = p / "doc_bert_emb.npy"
 
     for k, ap in adj_paths.items():
         if not ap.exists():
@@ -315,14 +324,17 @@ class UserSelfAttention(nn.Module):
         uid = user_ids.view(-1, 1)
         return (uid == uid.t()).float()
 
-    def forward(self, x: torch.Tensor, user_ids: torch.Tensor, same_user_bias: float = 1.0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, user_ids: torch.Tensor, same_user_bias: float = 5.0) -> torch.Tensor:
         Q = self.q(x)
         K = self.k(x)
         V = self.v(x)
-        att = (Q @ K.t()) / self.scale
-        A = F.softmax(att, dim=1)
-        S = self.build_S(user_ids).to(A.device)
-        return (A + float(same_user_bias) * S) @ V
+
+        logits = (Q @ K.t()) / self.scale
+        S = self.build_S(user_ids).to(logits.device)
+
+        logits = logits + float(same_user_bias) * S
+        A = F.softmax(logits, dim=1)
+        return A @ V
 
 
 class Step3Model(nn.Module):
@@ -332,11 +344,56 @@ class Step3Model(nn.Module):
         self.user_attn = UserSelfAttention(out_dim)
         self.cls = nn.Linear(out_dim, num_labels)
 
-    def forward(self, adj_norm: torch.Tensor, x: torch.Tensor, post_node_index: torch.Tensor, user_ids: torch.Tensor, same_user_bias: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        adj_norm: torch.Tensor,
+        x: torch.Tensor,
+        post_node_index: torch.Tensor,
+        user_ids: torch.Tensor,
+        same_user_bias: float = 5.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.enc(adj_norm, x)
         z = h[post_node_index]
         z_user = self.user_attn(z, user_ids, same_user_bias=same_user_bias)
         return self.cls(z_user), z_user
+
+
+class UserBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, doc_indices, users, batch_size, n_per_user=4, shuffle=True):
+        self.batch_size = batch_size
+        self.n_per_user = n_per_user
+        self.shuffle = shuffle
+        self.user_to_idx = collections.defaultdict(list)
+        for idx, doc_idx in enumerate(doc_indices):
+            u = users.get(doc_idx)
+            if u is not None:
+                self.user_to_idx[u].append(idx)
+
+    def __iter__(self):
+        user_lists = {u: list(idx_list) for u, idx_list in self.user_to_idx.items()}
+        if self.shuffle:
+            for u in user_lists:
+                random.shuffle(user_lists[u])
+
+        active_users = [u for u in user_lists if len(user_lists[u]) > 0]
+        while len(active_users) > 0:
+            batch = []
+            if self.shuffle:
+                random.shuffle(active_users)
+
+            users_to_pick = active_users[:max(1, self.batch_size // self.n_per_user)]
+            for u in users_to_pick:
+                chunk = user_lists[u][:self.n_per_user]
+                user_lists[u] = user_lists[u][self.n_per_user:]
+                batch.extend(chunk)
+
+            active_users = [u for u in active_users if len(user_lists[u]) > 0]
+            if len(batch) > 0:
+                yield batch
+
+    def __len__(self):
+        total_len = sum(len(v) for v in self.user_to_idx.values())
+        return max(1, (total_len + self.batch_size - 1) // self.batch_size)
 
 
 class SplitDocDataset(Dataset):
@@ -389,7 +446,7 @@ def make_loader(
     ds = SplitDocDataset(out_dir, split=split, builder=builder)
 
     def collate_fn(items: List[Dict[str, Any]]) -> Batched:
-        H_views = global_encoder(A_norm, X)  # per-batch, no detach => trainable
+        H_views = global_encoder(A_norm, X)
 
         doc_ids: List[int] = []
         user_ids: List[int] = []
@@ -427,9 +484,23 @@ def make_loader(
         user_t = torch.tensor(user_ids, dtype=torch.long, device=device)
         post_t = torch.tensor(post_idx, dtype=torch.long, device=device)
 
-        return Batched(doc_idx=doc_t, user_id=user_t, y=yb, x=Xb, adj_norm=Ab, post_node_index=post_t)
+        return Batched(
+            doc_idx=doc_t,
+            user_id=user_t,
+            y=yb,
+            x=Xb,
+            adj_norm=Ab,
+            post_node_index=post_t,
+        )
 
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, collate_fn=collate_fn, drop_last=False)
+    sampler = UserBatchSampler(
+        ds.doc_indices,
+        users,
+        batch_size=batch_size,
+        n_per_user=max(1, batch_size // 4),
+        shuffle=shuffle,
+    )
+    return DataLoader(ds, batch_sampler=sampler, num_workers=0, collate_fn=collate_fn)
 
 
 @torch.no_grad()
@@ -445,6 +516,7 @@ def evaluate(model: Step3Model, loader: DataLoader, theta: float, lam: float, sa
     for b in loader:
         logits, z = model(b.adj_norm, b.x, b.post_node_index, b.user_id, same_user_bias=same_user_bias)
         y = b.y
+
         logits_all.append(logits.detach().cpu())
         y_all.append(y.detach().cpu())
 
@@ -462,6 +534,7 @@ def evaluate(model: Step3Model, loader: DataLoader, theta: float, lam: float, sa
     y_pred = (probs >= 0.5).astype(np.int32)
 
     _, _, f1 = _f1_per_label(y_true, y_pred)
+
     out = {
         "loss": total / max(n_batches, 1),
         "bce": total_bce / max(n_batches, 1),
@@ -484,6 +557,35 @@ def grad_mean_abs(module: nn.Module) -> float:
     return tot / max(n, 1)
 
 
+def grad_l2_norm(module: nn.Module) -> float:
+    total_sq = 0.0
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total_sq += float((g * g).sum().item())
+    return total_sq ** 0.5
+
+
+@torch.no_grad()
+def batch_metrics_from_logits(logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
+    probs = torch.sigmoid(logits)
+    y_pred = (probs >= 0.5).float()
+
+    y_np = y.detach().cpu().numpy().astype(np.int32)
+    y_pred_np = y_pred.detach().cpu().numpy().astype(np.int32)
+
+    _, _, f1 = _f1_per_label(y_np, y_pred_np)
+
+    return {
+        "macro_f1": float(f1.mean()),
+        "prob_mean": float(probs.mean().item()),
+        "prob_std": float(probs.std(unbiased=False).item()),
+        "pred_pos_rate": float(y_pred.mean().item()),
+        "true_pos_rate": float(y.mean().item()),
+    }
+
+
 def train(
     out_dir: str,
     train_csv: str,
@@ -491,7 +593,7 @@ def train(
     test_csv: str,
     *,
     seed: int = 1,
-    max_epochs: int = 1000,
+    max_epochs: int = 5,
     patience: int = 10,
     lr_local: float = 1e-4,
     lr_global: float = 2e-5,
@@ -499,8 +601,8 @@ def train(
     batch_size: int = 8,
     theta: float = 10.0,
     lam: float = 0.01,
-    same_user_bias: float = 1.0,
-    grad_print_every: int = 200,
+    same_user_bias: float = 5.0,
+    grad_print_every: int = 25,
 ) -> None:
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -523,8 +625,11 @@ def train(
     global_encoder = GlobalEncoderEq1(dims_in).to(device)
     global_encoder.train()
 
-    # infer local in_dim from one batch
-    tmp_loader = make_loader(outp, "train", train_labels, train_users, builder, global_encoder, A_norm, X, device, batch_size=1, shuffle=False)
+    tmp_loader = make_loader(
+        outp, "train", train_labels, train_users,
+        builder, global_encoder, A_norm, X, device,
+        batch_size=1, shuffle=False
+    )
     tmp_batch = next(iter(tmp_loader))
     model = Step3Model(in_dim=int(tmp_batch.x.shape[1])).to(device)
 
@@ -536,9 +641,21 @@ def train(
     )
     bce = nn.BCEWithLogitsLoss()
 
-    train_loader = make_loader(outp, "train", train_labels, train_users, builder, global_encoder, A_norm, X, device, batch_size=batch_size, shuffle=True)
-    val_loader = make_loader(outp, "val", val_labels, val_users, builder, global_encoder, A_norm, X, device, batch_size=batch_size, shuffle=False)
-    test_loader = make_loader(outp, "test", test_labels, test_users, builder, global_encoder, A_norm, X, device, batch_size=batch_size, shuffle=False)
+    train_loader = make_loader(
+        outp, "train", train_labels, train_users,
+        builder, global_encoder, A_norm, X, device,
+        batch_size=batch_size, shuffle=True
+    )
+    val_loader = make_loader(
+        outp, "val", val_labels, val_users,
+        builder, global_encoder, A_norm, X, device,
+        batch_size=batch_size, shuffle=False
+    )
+    test_loader = make_loader(
+        outp, "test", test_labels, test_users,
+        builder, global_encoder, A_norm, X, device,
+        batch_size=batch_size, shuffle=False
+    )
 
     best_val = float("inf")
     bad = 0
@@ -551,12 +668,20 @@ def train(
 
         total = total_b = total_c = 0.0
         n_batches = 0
+        train_logits_all: List[torch.Tensor] = []
+        train_y_all: List[torch.Tensor] = []
 
-        for b in train_loader:
+        for bi, b in enumerate(train_loader, start=1):
             step += 1
             opt.zero_grad(set_to_none=True)
 
-            logits, z = model(b.adj_norm, b.x, b.post_node_index, b.user_id, same_user_bias=same_user_bias)
+            logits, z = model(
+                b.adj_norm,
+                b.x,
+                b.post_node_index,
+                b.user_id,
+                same_user_bias=same_user_bias,
+            )
             y = b.y
 
             l_b = bce(logits, y)
@@ -564,8 +689,14 @@ def train(
             loss = l_b + lam * l_c
 
             loss.backward()
-            if step % grad_print_every == 0:
-                print(f"[grad] step={step} global_mean_abs={grad_mean_abs(global_encoder):.3e} local_mean_abs={grad_mean_abs(model):.3e}")
+
+            g_mean_global = grad_mean_abs(global_encoder)
+            g_mean_local = grad_mean_abs(model)
+            g_norm_global = grad_l2_norm(global_encoder)
+            g_norm_local = grad_l2_norm(model)
+
+            batch_stats = batch_metrics_from_logits(logits, y)
+
             opt.step()
 
             total += float(loss.item())
@@ -573,50 +704,130 @@ def train(
             total_c += float(l_c.item())
             n_batches += 1
 
+            train_logits_all.append(logits.detach().cpu())
+            train_y_all.append(y.detach().cpu())
+
+            if step % grad_print_every == 0:
+                lr_local_now = opt.param_groups[0]["lr"]
+                lr_global_now = opt.param_groups[1]["lr"]
+
+                avg_loss = total / max(n_batches, 1)
+                avg_bce = total_b / max(n_batches, 1)
+                avg_cl = total_c / max(n_batches, 1)
+
+                print(
+                    f"[train] "
+                    f"epoch={ep:03d}/{max_epochs:03d} "
+                    f"batch={bi:04d}/{len(train_loader):04d} "
+                    f"step={step:06d} | "
+                    f"loss={loss.item():.4f} avg={avg_loss:.4f} | "
+                    f"bce={l_b.item():.4f} avg_bce={avg_bce:.4f} | "
+                    f"cl={l_c.item():.4f} avg_cl={avg_cl:.4f} | "
+                    f"batch_macroF1={batch_stats['macro_f1']:.4f} | "
+                    f"prob_mean={batch_stats['prob_mean']:.4f} "
+                    f"prob_std={batch_stats['prob_std']:.4f} | "
+                    f"pred_pos={batch_stats['pred_pos_rate']:.4f} "
+                    f"true_pos={batch_stats['true_pos_rate']:.4f} | "
+                    f"global_mean_abs={g_mean_global:.3e} local_mean_abs={g_mean_local:.3e} | "
+                    f"g_l2(global/local)=({g_norm_global:.3e}/{g_norm_local:.3e}) | "
+                    f"lr(global/local)=({lr_global_now:.2e}/{lr_local_now:.2e})",
+                    flush=True,
+                )
+
         tr_loss = total / max(n_batches, 1)
         tr_b = total_b / max(n_batches, 1)
         tr_c = total_c / max(n_batches, 1)
 
+        train_probs = torch.sigmoid(torch.cat(train_logits_all, dim=0)).numpy()
+        train_true = torch.cat(train_y_all, dim=0).numpy().astype(np.int32)
+        train_pred = (train_probs >= 0.5).astype(np.int32)
+        _, _, train_f1 = _f1_per_label(train_true, train_pred)
+        train_macro_f1 = float(train_f1.mean())
+
         va = evaluate(model, val_loader, theta=theta, lam=lam, same_user_bias=same_user_bias)
-        print(f"epoch={ep} train_loss={tr_loss:.4f} (bce={tr_b:.4f}, cl={tr_c:.4f}) val_loss={va['loss']:.4f} val_macroF1={va['macro_f1']:.4f} (bce={va['bce']:.4f}, cl={va['cl']:.4f})")
+
+        print(
+            f"[epoch-summary] "
+            f"epoch={ep:03d}/{max_epochs:03d} | "
+            f"train_loss={tr_loss:.4f} train_bce={tr_b:.4f} train_cl={tr_c:.4f} "
+            f"train_macroF1={train_macro_f1:.4f} | "
+            f"val_loss={va['loss']:.4f} val_bce={va['bce']:.4f} val_cl={va['cl']:.4f} "
+            f"val_macroF1={va['macro_f1']:.4f} | "
+            f"val_F1[OPEN={va['f1_OPEN']:.4f}, CON={va['f1_CON']:.4f}, EXT={va['f1_EXT']:.4f}, "
+            f"AGR={va['f1_AGR']:.4f}, NEU={va['f1_NEU']:.4f}]",
+            flush=True,
+        )
 
         if va["loss"] + 1e-9 < best_val:
+            prev_best = best_val
             best_val = va["loss"]
             bad = 0
-            torch.save({"local": model.state_dict(), "global": global_encoder.state_dict(), "epoch": ep, "best_val": best_val}, best_path)
+            torch.save(
+                {
+                    "local": model.state_dict(),
+                    "global": global_encoder.state_dict(),
+                    "epoch": ep,
+                    "best_val": best_val,
+                    "best_val_macroF1": va["macro_f1"],
+                },
+                best_path,
+            )
+            print(
+                f"[checkpoint] epoch={ep:03d} NEW BEST | "
+                f"val_loss: {prev_best:.4f} -> {best_val:.4f} | "
+                f"val_macroF1={va['macro_f1']:.4f} | "
+                f"saved_to={best_path.name}",
+                flush=True,
+            )
         else:
             bad += 1
+            print(
+                f"[checkpoint] epoch={ep:03d} no improvement | "
+                f"best_val={best_val:.4f} | "
+                f"epochs_without_improvement={bad}/{patience}",
+                flush=True,
+            )
             if bad >= patience:
-                print(f"[EARLY STOP] no val-loss improvement for {patience} epochs. best_val={best_val:.4f}")
+                print(
+                    f"[EARLY STOP] stopped at epoch={ep:03d} | "
+                    f"best_val={best_val:.4f} | "
+                    f"patience={patience}",
+                    flush=True,
+                )
                 break
 
-    print("Saved best:", best_path)
+    print(f"[done] best_checkpoint={best_path}", flush=True)
+
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["local"])
     global_encoder.load_state_dict(ckpt["global"])
 
     te = evaluate(model, test_loader, theta=theta, lam=lam, same_user_bias=same_user_bias)
-    print(f"TEST loss={te['loss']:.4f} macroF1={te['macro_f1']:.4f} OPEN={te['f1_OPEN']:.4f} CON={te['f1_CON']:.4f} EXT={te['f1_EXT']:.4f} AGR={te['f1_AGR']:.4f} NEU={te['f1_NEU']:.4f}")
+    print(
+        f"[test-summary] "
+        f"loss={te['loss']:.4f} bce={te['bce']:.4f} cl={te['cl']:.4f} "
+        f"macroF1={te['macro_f1']:.4f} | "
+        f"F1[OPEN={te['f1_OPEN']:.4f}, CON={te['f1_CON']:.4f}, EXT={te['f1_EXT']:.4f}, "
+        f"AGR={te['f1_AGR']:.4f}, NEU={te['f1_NEU']:.4f}]",
+        flush=True,
+    )
+
 
 if __name__ == "__main__":
     import os
-    from pathlib import Path
 
     ROOT = Path(__file__).resolve().parent
 
-    # Repo-relative defaults
     OUT_DIR_DEFAULT = ROOT / "outputs" / "global_graph_output"
-    DATA_PROCESSED_DEFAULT = ROOT / "data" / "processed"
+    DATA_PROCESSED_DEFAULT = ROOT / "data" / "processed" / "preprocess_check_out"
 
-    # Allow overrides (optional)
     OUT_DIR = Path(os.getenv("GLOBAL_GRAPH_OUT", str(OUT_DIR_DEFAULT)))
     DATA_PROCESSED = Path(os.getenv("DATA_PROCESSED", str(DATA_PROCESSED_DEFAULT)))
 
-    TRAIN_CSV = Path(os.getenv("TRAIN_CSV", str(DATA_PROCESSED / "train_after_preproessing.csv")))
-    VAL_CSV = Path(os.getenv("VAL_CSV", str(DATA_PROCESSED / "val_after_preproessing.csv")))
-    TEST_CSV = Path(os.getenv("TEST_CSV", str(DATA_PROCESSED / "test_after_preproessing.csv")))
+    TRAIN_CSV = Path(os.getenv("TRAIN_CSV", str(DATA_PROCESSED / "final_train_preprocessed.csv")))
+    VAL_CSV = Path(os.getenv("VAL_CSV", str(DATA_PROCESSED / "final_val_preprocessed.csv")))
+    TEST_CSV = Path(os.getenv("TEST_CSV", str(DATA_PROCESSED / "final_test_preprocessed.csv")))
 
-    # Create output folder if missing
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     train(
@@ -633,6 +844,6 @@ if __name__ == "__main__":
         batch_size=32,
         theta=10.0,
         lam=0.01,
-        same_user_bias=1.0,
-        grad_print_every=200,
+        same_user_bias=5.0,
+        grad_print_every=25,
     )

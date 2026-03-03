@@ -176,7 +176,7 @@ def load_step2_inputs(out_dir: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, 
     adj_paths = {
         "word": p / "adj_word.pkl",
         "pos": p / "adj_tag.pkl",
-        "liwc": p / "adj_liwc.pkl",
+        "liwc": p / "adj_empath.pkl",
         "entity": p / "adj_entity.pkl",
         "text": p / "adj_text.pkl",
     }
@@ -191,7 +191,7 @@ def load_step2_inputs(out_dir: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, 
     feat_paths = {
         "word": p / "word_type_bert_emb.pkl",
         "pos": p / "pos_onehot.pkl",
-        "liwc": p / "liwc_onehot.pkl",
+        "liwc": p / "empath_onehot.pkl",
         "entity": p / "entity_emb.pkl",
         "text": p / "doc_bert_emb.npy",
     }

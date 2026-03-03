@@ -25,7 +25,7 @@ from global_encoder import sanity_forward, save_global_embeddings
 
 def main() -> None:
     root = Path(__file__).resolve().parent
-    out_dir = root / "outputs" / "global_graph_output"
+    out_dir = root.parent / "src" / "outputs" / "global_graph_output"
 
     if not out_dir.exists():
         raise FileNotFoundError(

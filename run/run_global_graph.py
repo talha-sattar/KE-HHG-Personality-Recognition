@@ -21,8 +21,8 @@ def _require_file(p: Path, env_name: str) -> str:
 def main() -> None:
     root = Path(__file__).resolve().parent
 
-    data_processed = root / "data" / "processed"
-    out_dir = root / "outputs" / "global_graph_output"
+    data_processed = root.parent / "src" / "data" / "processed" / "preprocess_check_out"
+    out_dir = root.parent / "src" / "outputs" / "global_graph_output"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Required CSVs
@@ -38,15 +38,13 @@ def main() -> None:
             )
 
     # Resource defaults (repo-relative)
-    nell_ent2ids_default = root / "assets" / "nell" / "entity2id.json"
-    transe_vec_default = root / "assets" / "nell" / "entity2vec.bern"
-    liwc_dic_default = root / "assets" / "liwc" / "LIWC2015 Dictionary.dic"
-    nltk_data_default = root / "assets" / "nltk_data"
+    nell_ent2ids_default = root.parent / "data" / "assets" / "entity2id.json"
+    transe_vec_default = root.parent / "data" / "assets" / "entity2vec.bern"
+    nltk_data_default = root.parent / "data" / "assets" / "nltk_data"
 
     # Allow overrides via env vars (recommended for big/private files)
     nell_ent2ids = Path(os.getenv("NELL_ENT2ID", str(nell_ent2ids_default)))
     transe_vec = Path(os.getenv("TRANSE_VEC", str(transe_vec_default)))
-    liwc_dic = Path(os.getenv("LIWC_DIC", str(liwc_dic_default)))
     nltk_data_dir = Path(os.getenv("NLTK_DATA_DIR", str(nltk_data_default)))
 
     out = build_personality_graphs(
@@ -80,17 +78,17 @@ def main() -> None:
         min_margin=0.06,
 
         # LIWC ONLY (Empath off)
-        use_liwc=True,
-        liwc_dic=_require_file(liwc_dic, "LIWC_DIC"),
+        use_liwc=False,
+        liwc_dic="",
         liwc_min_hits=1,
         liwc_binary_edges=True,
         liwc_keep_numbers=True,
-        use_empath=False,
+        use_empath=True,
 
         # Doc-BERT
         build_doc_bert=True,
         doc_bert_model="bert-base-uncased",
-        doc_bert_device="cpu",
+        doc_bert_device="cuda",
     )
 
     print("Artifacts at:", out)

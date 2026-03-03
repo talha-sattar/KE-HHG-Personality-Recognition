@@ -58,8 +58,8 @@ ASSETS_DIR = ROOT / "assets"
 OUTPUTS_DIR = ROOT / "outputs"
 
 # ---- Step A: Sentence split ----
-RAW_TRAIN_CSV = RAW_DIR / "Training Sample.csv"
-RAW_TEST_CSV = RAW_DIR / "Test Sample.csv"
+RAW_TRAIN_CSV = Path(r"e:\Personality Identification Using GNNs - Research\Workflow_KEHHG\personality-graph_KEHHG\Dataset\all_text_merged_with self-reported personality scores (Training Sample).csv")
+RAW_TEST_CSV = Path(r"e:\Personality Identification Using GNNs - Research\Workflow_KEHHG\personality-graph_KEHHG\Dataset\all_text_merged_with self-reported personality scores (Test Sample).csv")
 RAW_TEXT_COL = "chat text"  # column to split into sentences
 SAT_MODEL_NAME = "sat-3l-sm"
 NEWLINE_FIRST = True
@@ -153,35 +153,42 @@ def explode_sentences(input_csv: Path, text_col: str, output_csv: Path) -> None:
     if text_col not in df.columns:
         raise KeyError(f"Column '{text_col}' not found. Available: {df.columns.tolist()}")
 
-    sat = SaT(SAT_MODEL_NAME)
+    # Add ID_COL if missing
+    if USER_COL not in df.columns:
+        if "train" in str(input_csv).lower():
+            df[USER_COL] = [f"train_{i}" for i in range(len(df))]
+        else:
+            df[USER_COL] = [f"test_{i}" for i in range(len(df))]
 
-    out_rows: List[Dict[str, Any]] = []
-    cols = df.columns.tolist()
-    text_idx = cols.index(text_col)
+    import torch
+    from wtpsplit import SaT
+    print("Loading SKFRL model...")
+    sat = SaT("sat-3l")
+    if torch.cuda.is_available():
+        sat.half().to("cuda")
 
-    for row_tuple in df.itertuples(index=False, name=None):
-        base = dict(zip(cols, row_tuple))
-        sentences = segment_text(sat, row_tuple[text_idx])
+    out_records = []
+    texts = df[text_col].astype(str).tolist()
+    print(f"Splitting {len(texts)} texts...")
+    
+    split_results = list(sat.split(texts))
+    
+    for row_idx, doc_sentences in enumerate(split_results):
+        row = df.iloc[row_idx]
+        for s_idx, sentence in enumerate(doc_sentences):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            new_row = row.to_dict()
+            new_row["sentence_index"] = s_idx
+            new_row["sentence_text"] = sentence
+            new_row["splitter_used"] = "SKFRL:sat-3l"
+            out_records.append(new_row)
 
-        if not sentences:
-            r = base.copy()
-            r["sentence_index"] = 0
-            r["sentence_text"] = ""
-            r["splitter_used"] = f"wtpsplit:SaT:{SAT_MODEL_NAME}"
-            out_rows.append(r)
-            continue
-
-        for s_idx, sent in enumerate(sentences):
-            r = base.copy()
-            r["sentence_index"] = s_idx
-            r["sentence_text"] = sent
-            r["splitter_used"] = f"wtpsplit:SaT:{SAT_MODEL_NAME}"
-            out_rows.append(r)
-
-    out_df = pd.DataFrame(out_rows)
+    out_df = pd.DataFrame(out_records)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_csv, index=False)
-    print("✅ Step A saved:", output_csv, "rows=", len(out_df))
+    print("✅ Step A (SKFRL SaT) saved:", output_csv, "rows=", len(out_df))
 
 
 # =============================================================================
@@ -198,8 +205,13 @@ def _to_float(x: pd.Series) -> np.ndarray:
 
 def compute_thresholds_on_train(train_df: pd.DataFrame, trait_cols: List[str], seed: int) -> Dict[str, Dict[str, float]]:
     thr: Dict[str, Dict[str, float]] = {}
+    if USER_COL in train_df.columns:
+        user_df = train_df.groupby(USER_COL)[trait_cols].mean()
+    else:
+        user_df = train_df
+
     for col in trait_cols:
-        x = _to_float(train_df[col])
+        x = _to_float(user_df[col])
         x = x[~np.isnan(x)]
         if x.size == 0:
             thr[col] = {"mean": np.nan, "median": np.nan, "kmeans": np.nan}
@@ -273,7 +285,7 @@ def binarize_traits(train_csv: Path, test_csv: Path, out_dir: Path, method: str,
     for col in TRAIT_COLS:
         tr = _safe_to_float(train_df[col]).to_numpy()
         te = _safe_to_float(test_df[col]).to_numpy()
-        thr = _compute_threshold(tr, method, seed)
+        thr = thresholds[col][method]   # use TRAIN-only user-level threshold already computed
         train_out[f"{col}_bin_{method}"] = _binarize_with_threshold(tr, thr)
         test_out[f"{col}_bin_{method}"] = _binarize_with_threshold(te, thr)
 
