@@ -32,7 +32,7 @@ python -X utf8 src/preprocessing_pipeline.py
 This step builds the transductive adjacency matrices (Word, POS, LIWC/Empath, Entity, Text) and calculates the `Doc-BERT` embeddings using CUDA. **This step might take a few minutes.**
 
 ```powershell
-set PYTHONPATH=src&& python -X utf8 src\run\run_global_graph.py
+set PYTHONPATH=src&& python -X utf8 run\run_global_graph.py
 ```
 *Outputs: Pickled adjacency graphs (`adj_*.pkl`) and the main PyTorch geometric cache (`H_views.pt`) inside `src/outputs/global_graph_output/`.*
 
