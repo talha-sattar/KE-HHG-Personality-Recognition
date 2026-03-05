@@ -20,8 +20,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from GCN import GCN
-from global_encoder import sanity_forward, save_global_embeddings
-
+from global_encoder import GLOBAL_GCN_DIM, sanity_forward, save_global_embeddings
+from global_encoder import GLOBAL_GCN_DIM
 
 def main() -> None:
     root = Path(__file__).resolve().parent
@@ -35,8 +35,8 @@ def main() -> None:
 
     # Keep dims consistent with your current setting.
     # If you want paper-matching dims, set hid_dim=400, out_dim=400.
-    hid_dim = 400
-    out_dim = 400
+    hid_dim = GLOBAL_GCN_DIM
+    out_dim = GLOBAL_GCN_DIM
 
     save_global_embeddings(str(out_dir), GCN, hid_dim=hid_dim, out_dim=out_dim)
     sanity_forward(str(out_dir), GCN, hid_dim=hid_dim, out_dim=out_dim)

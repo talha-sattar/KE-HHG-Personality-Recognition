@@ -246,15 +246,40 @@ class LocalGraphBuilder:
 
         self.word_id2_list = _load_word_id2_list(self.outp)
 
-        # Empath mapping: token -> [cats] where cats may be names ("family") or ids
-        self.liwc_token2cats: Dict[str, List[Any]] = _load_json(self.outp / "empath_word2cats.json")
+        # -----------------------
+        # Lexicon mapping (Empath or LIWC)
+        # -----------------------
+        # token -> [cats] where cats may be names ("family") or ids
+        self.lex_token2cats: Dict[str, List[Any]] = {}
+        self.lex_name2id: Optional[Dict[str, int]] = None
 
-        # Empath id2 list for name->id mapping (optional but needed when cats are names)
-        self.liwc_name2id: Optional[Dict[str, int]] = None
+        # Prefer Empath artifacts if present; otherwise fall back to LIWC artifacts.
+        empath_map_path = self.outp / "empath_word2cats.json"
+        liwc_map_path = self.outp / "liwc_word2cats.json"
+
+        if empath_map_path.exists():
+            self.lex_token2cats = _load_json(empath_map_path)
+            self.lex_kind = "empath"
+        elif liwc_map_path.exists():
+            self.lex_token2cats = _load_json(liwc_map_path)
+            self.lex_kind = "liwc"
+        else:
+            self.lex_kind = "none"
+
+        # Name -> id mapping (only needed when cats are strings)
+        # For Empath, empath_id2_list.json 
+        # For LIWC, liwc_id2_list.json.
+        empath_id2_path = self.outp / "empath_id2_list.json"
         liwc_id2_path = self.outp / "liwc_id2_list.json"
-        if liwc_id2_path.exists():
-            liwc_id2 = _load_json(liwc_id2_path)
-            self.liwc_name2id = {str(name).strip().lower(): i for i, name in enumerate(liwc_id2)}
+
+        id2 = None
+        if empath_id2_path.exists():
+            id2 = _load_json(empath_id2_path)
+        elif liwc_id2_path.exists():
+            id2 = _load_json(liwc_id2_path)
+
+        if id2 is not None:
+            self.lex_name2id = {str(name).strip().lower(): i for i, name in enumerate(id2)}
 
         # Optional: global word PMI adjacency for paper-faithful local word-word weights (Eq. 3)
         # If present, we will weight adjacent word-word edges by PMI(w_i, w_{i+1}) looked up from this matrix.
@@ -340,7 +365,7 @@ class LocalGraphBuilder:
             edges.append((w_lid, e_lid, "contain_word_entity", 1.0))
             edges.append((e_lid, w_lid, "contain_entity_word", 1.0))
 
-        # word-empath edges (token lookup, cats may be names or ids)
+        # word-lexicon edges (Empath or LIWC; token lookup, cats may be names or ids)
         for wid in uniq_words:
             wid = int(wid)
             if wid < 0 or wid >= len(self.word_id2_list):
@@ -348,7 +373,8 @@ class LocalGraphBuilder:
             token = str(self.word_id2_list[wid]).strip().lower()
             if not token:
                 continue
-            cats = self.liwc_token2cats.get(token, [])
+
+            cats = self.lex_token2cats.get(token, [])
             if not cats:
                 continue
 
@@ -363,10 +389,11 @@ class LocalGraphBuilder:
                     if s.isdigit():
                         cat_id = int(s)
                     else:
-                        if self.liwc_name2id is None or s not in self.liwc_name2id:
+                        if self.lex_name2id is None or s not in self.lex_name2id:
                             continue
-                        cat_id = self.liwc_name2id[s]
+                        cat_id = self.lex_name2id[s]
 
+                # Keep node type as "liwc" to avoid touching downstream code / colors / H_liwc mapping.
                 c_lid = _get("liwc", int(cat_id))
                 edges.append((w_lid, c_lid, "contain_word_liwc", 1.0))
                 edges.append((c_lid, w_lid, "contain_liwc_word", 1.0))

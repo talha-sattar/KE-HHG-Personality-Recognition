@@ -17,6 +17,7 @@ try:
 except Exception as e:
     raise SystemExit("scipy is required to load sparse adjacencies") from e
 
+GLOBAL_GCN_DIM = 400
 
 def load_pkl(path: Path) -> Any:
     with open(path, "rb") as f:
@@ -41,7 +42,7 @@ def load_feature(path: Path) -> torch.Tensor:
 
     # 2) list/tuple -> stack
     if isinstance(obj, (list, tuple)):
-        arr = np.asarray(obj)
+        arr = np.asarray(obj, dtype=object)
         if arr.dtype == object:
             arr = np.stack([np.asarray(x, dtype=np.float32) for x in obj], axis=0)
         else:
@@ -60,20 +61,12 @@ def load_feature(path: Path) -> torch.Tensor:
             arr = obj.astype(np.float32, copy=False)
         return torch.tensor(arr, dtype=torch.float32)
 
-    # 4) everything else -> try numpy conversion
+    # 4) numpy conversion - Others
     arr = np.asarray(obj)
     if arr.dtype == object:
-        arr = arr.astype(np.float32)  # may still fail; then it's truly non-numeric
+        arr = arr.astype(np.float32)
     else:
         arr = arr.astype(np.float32, copy=False)
-    return torch.tensor(arr, dtype=torch.float32)
-
-    """Load .pkl/.npy feature matrices into float32 torch dense tensor."""
-    if path.suffix == ".npy":
-        arr = np.load(path)
-    else:
-        arr = load_pkl(path)
-    arr = np.asarray(arr)
     return torch.tensor(arr, dtype=torch.float32)
 
 
@@ -210,7 +203,7 @@ def load_step2_inputs(out_dir: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, 
     dims_in = {k: int(X[k].shape[1]) for k in X}
     return A_norm, X, dims_in
 
-def save_global_embeddings(out_dir: str, gcn_layer_cls: type[nn.Module], hid_dim: int = 256, out_dim: int = 256) -> None:
+def save_global_embeddings(out_dir: str, gcn_layer_cls: type[nn.Module], hid_dim: int = GLOBAL_GCN_DIM, out_dim: int = GLOBAL_GCN_DIM) -> None:
     A_norm, X, dims_in = load_step2_inputs(out_dir)
     enc = Step2GlobalEncoder(gcn_layer_cls, dims_in, hid_dim, out_dim, dropout=0.5)
     enc.eval()
@@ -231,7 +224,7 @@ def save_global_embeddings(out_dir: str, gcn_layer_cls: type[nn.Module], hid_dim
     print("Saved:", p / "H_views.pt")
 
 
-def sanity_forward(out_dir: str, gcn_layer_cls: type[nn.Module], hid_dim: int = 256, out_dim: int = 256) -> None:
+def sanity_forward(out_dir: str, gcn_layer_cls: type[nn.Module], hid_dim: int = GLOBAL_GCN_DIM, out_dim: int = GLOBAL_GCN_DIM) -> None:
     """One-time check that Step 2 runs and shapes match."""
     A_norm, X, dims_in = load_step2_inputs(out_dir)
     enc = Step2GlobalEncoder(gcn_layer_cls, dims_in, hid_dim, out_dim, dropout=0.5)

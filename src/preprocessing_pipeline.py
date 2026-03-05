@@ -8,10 +8,10 @@ Step C) Train/Val split by USER (no leakage by user)
 Step D) Text preprocessing: produce prep_text_strict + pos_raw_word_pos
 
 Outputs:
-  - labels_binarized/thresholds_mean_median_kmeans.json
-  - labels_binarized/train_binarized_<METHOD>.csv, test_binarized_<METHOD>.csv
-  - train.csv, val.csv, test.csv
-  - preprocess_check_out/train_preprocessed.csv, val_preprocessed.csv, test_preprocessed.csv
+  - outputs/labels_binarized/thresholds_mean_median_kmeans.json
+  - outputs/labels_binarized/train_binarized_<METHOD>.csv, test_binarized_<METHOD>.csv
+  - data/processed/train.csv, val.csv, test.csv
+  - data/processed/preprocess_check_out/final_{train,val,test}_preprocessed.csv
 
 Dependencies:
   pip install pandas numpy scikit-learn matplotlib wtpsplit nltk contractions openpyxl
@@ -19,6 +19,7 @@ Dependencies:
 
 from __future__ import annotations
 
+import os  # ✅ ISSUE 9 fix: env var paths
 import csv
 import json
 import random
@@ -58,8 +59,9 @@ ASSETS_DIR = ROOT / "assets"
 OUTPUTS_DIR = ROOT / "outputs"
 
 # ---- Step A: Sentence split ----
-RAW_TRAIN_CSV = Path(r"e:\Personality Identification Using GNNs - Research\Workflow_KEHHG\personality-graph_KEHHG\Dataset\all_text_merged_with self-reported personality scores (Training Sample).csv")
-RAW_TEST_CSV = Path(r"e:\Personality Identification Using GNNs - Research\Workflow_KEHHG\personality-graph_KEHHG\Dataset\all_text_merged_with self-reported personality scores (Test Sample).csv")
+# ✅ ISSUE 9 fix: no hardcoded Windows paths; overridable via environment variables
+RAW_TRAIN_CSV = Path(os.getenv("RAW_TRAIN_CSV", str(RAW_DIR / "train_raw.csv")))
+RAW_TEST_CSV = Path(os.getenv("RAW_TEST_CSV", str(RAW_DIR / "test_raw.csv")))
 RAW_TEXT_COL = "chat text"  # column to split into sentences
 SAT_MODEL_NAME = "sat-3l-sm"
 NEWLINE_FIRST = True
@@ -96,10 +98,13 @@ MAKE_PLOTS = True
 BINS_PER_TRAIT = 20
 DOT_SAMPLE_CAP = 5000
 
+# ✅ ISSUE 13 enhancement: validate trait constancy within each user (recommended)
+VALIDATE_USER_TRAIT_CONSTANCY = True
+CONSTANCY_EPS = 1e-6
+
 # =============================================================================
 # End CONFIG
 # =============================================================================
-
 
 
 # =============================================================================
@@ -146,6 +151,10 @@ def segment_text(sat: SaT, text: str) -> List[str]:
 
 
 def explode_sentences(input_csv: Path, text_col: str, output_csv: Path) -> None:
+    """
+    Reads input CSV and explodes each row into multiple sentence rows.
+    Keeps all original columns and adds: sentence_index, sentence_text, splitter_used.
+    """
     if not input_csv.exists():
         raise FileNotFoundError(f"Missing input CSV: {input_csv}")
 
@@ -153,42 +162,40 @@ def explode_sentences(input_csv: Path, text_col: str, output_csv: Path) -> None:
     if text_col not in df.columns:
         raise KeyError(f"Column '{text_col}' not found. Available: {df.columns.tolist()}")
 
-    # Add ID_COL if missing
+    # Add ID_COL if missing (fallback to per-row ids)
     if USER_COL not in df.columns:
-        if "train" in str(input_csv).lower():
-            df[USER_COL] = [f"train_{i}" for i in range(len(df))]
-        else:
-            df[USER_COL] = [f"test_{i}" for i in range(len(df))]
+        prefix = "train" if "train" in str(input_csv).lower() else "test"
+        df[USER_COL] = [f"{prefix}_{i}" for i in range(len(df))]
 
     import torch
-    from wtpsplit import SaT
-    print("Loading SKFRL model...")
-    sat = SaT("sat-3l")
+    print(f"Loading SaT model: {SAT_MODEL_NAME} ...")
+    sat = SaT(SAT_MODEL_NAME)
     if torch.cuda.is_available():
         sat.half().to("cuda")
 
-    out_records = []
-    texts = df[text_col].astype(str).tolist()
+    out_records: List[Dict[str, Any]] = []
+    texts = df[text_col].fillna("").astype(str).tolist()
     print(f"Splitting {len(texts)} texts...")
-    
+
+    # wtpsplit supports list input; returns list-of-list sentences
     split_results = list(sat.split(texts))
-    
+
     for row_idx, doc_sentences in enumerate(split_results):
         row = df.iloc[row_idx]
         for s_idx, sentence in enumerate(doc_sentences):
-            sentence = sentence.strip()
+            sentence = (sentence or "").strip()
             if not sentence:
                 continue
             new_row = row.to_dict()
-            new_row["sentence_index"] = s_idx
+            new_row["sentence_index"] = int(s_idx)
             new_row["sentence_text"] = sentence
-            new_row["splitter_used"] = "SKFRL:sat-3l"
+            new_row["splitter_used"] = f"SaT:{SAT_MODEL_NAME}"
             out_records.append(new_row)
 
     out_df = pd.DataFrame(out_records)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(output_csv, index=False)
-    print("✅ Step A (SKFRL SaT) saved:", output_csv, "rows=", len(out_df))
+    out_df.to_csv(output_csv, index=False, encoding="utf-8")
+    print("✅ Step A saved:", output_csv, "rows=", len(out_df))
 
 
 # =============================================================================
@@ -203,10 +210,51 @@ def _to_float(x: pd.Series) -> np.ndarray:
     return pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
 
 
-def compute_thresholds_on_train(train_df: pd.DataFrame, trait_cols: List[str], seed: int) -> Dict[str, Dict[str, float]]:
+def _validate_user_trait_constancy(df: pd.DataFrame, trait_cols: List[str]) -> None:
+    """
+    ✅ ISSUE 13 fix (document + validate):
+    Thresholds are computed at USER level (one personality vector per user).
+    We then apply thresholds row-wise because each sentence row repeats the same user score.
+    This function optionally checks that within each user, the trait values are effectively constant.
+    """
+    if USER_COL not in df.columns:
+        return
+
+    # Convert traits to numeric and compute max-min per user
+    sub = df[[USER_COL] + trait_cols].copy()
+    for c in trait_cols:
+        sub[c] = pd.to_numeric(sub[c], errors="coerce")
+
+    # Per-user range
+    ranges = sub.groupby(USER_COL)[trait_cols].agg(lambda s: np.nanmax(s) - np.nanmin(s))
+    # If a user has all NaNs, range is NaN; ignore those
+    bad_mask = (ranges > CONSTANCY_EPS).any(axis=1)
+    n_bad = int(bad_mask.sum())
+    if n_bad > 0:
+        bad_users = ranges.index[bad_mask].tolist()[:10]
+        print(
+            f"⚠️ WARNING: {n_bad} users have non-constant trait values across rows "
+            f"(showing up to 10): {bad_users}. "
+            f"If this is unexpected, binarize at user-level then merge back."
+        )
+
+
+def compute_thresholds_on_train(
+    train_df: pd.DataFrame,
+    trait_cols: List[str],
+    seed: int,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Computes thresholds using TRAIN split only.
+    IMPORTANT (ISSUE 13):
+      - If USER_COL exists, thresholds are computed on per-user means (one score per user).
+      - These thresholds are later applied row-wise (sentence rows), which is correct as long as each
+        sentence row repeats the user's score (validated optionally).
+    """
     thr: Dict[str, Dict[str, float]] = {}
+
     if USER_COL in train_df.columns:
-        user_df = train_df.groupby(USER_COL)[trait_cols].mean()
+        user_df = train_df.groupby(USER_COL)[trait_cols].mean(numeric_only=True)
     else:
         user_df = train_df
 
@@ -216,28 +264,17 @@ def compute_thresholds_on_train(train_df: pd.DataFrame, trait_cols: List[str], s
         if x.size == 0:
             thr[col] = {"mean": np.nan, "median": np.nan, "kmeans": np.nan}
             continue
+
         mu = float(np.mean(x))
         md = float(np.median(x))
+
         km = KMeans(n_clusters=2, n_init=10, random_state=seed).fit(x.reshape(-1, 1))
         centers = np.sort(km.cluster_centers_.ravel())
         km_mid = float((centers[0] + centers[1]) / 2.0)
+
         thr[col] = {"mean": mu, "median": md, "kmeans": km_mid}
+
     return thr
-
-
-def _compute_threshold(train_vals: np.ndarray, method: str, seed: int) -> float:
-    x = train_vals[~np.isnan(train_vals)]
-    if x.size == 0:
-        return np.nan
-    if method == "mean":
-        return float(np.mean(x))
-    if method == "median":
-        return float(np.median(x))
-    if method == "kmeans":
-        km = KMeans(n_clusters=2, n_init=10, random_state=seed).fit(x.reshape(-1, 1))
-        c = np.sort(km.cluster_centers_.ravel())
-        return float((c[0] + c[1]) / 2.0)
-    raise ValueError(f"Unknown method: {method}")
 
 
 def _binarize_with_threshold(vals: np.ndarray, thr: float) -> np.ndarray:
@@ -246,7 +283,12 @@ def _binarize_with_threshold(vals: np.ndarray, thr: float) -> np.ndarray:
     return np.where(np.isnan(vals), np.nan, (vals >= thr).astype(float))
 
 
-def plot_hist_panels(train_df: pd.DataFrame, trait_cols: List[str], thresholds: Dict[str, Dict[str, float]], out_png: Path) -> None:
+def plot_hist_panels(
+    train_df: pd.DataFrame,
+    trait_cols: List[str],
+    thresholds: Dict[str, Dict[str, float]],
+    out_png: Path,
+) -> None:
     n = len(trait_cols)
     fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(8, 1.9 * n), constrained_layout=True)
     if n == 1:
@@ -265,7 +307,17 @@ def plot_hist_panels(train_df: pd.DataFrame, trait_cols: List[str], thresholds: 
     plt.close(fig)
 
 
-def binarize_traits(train_csv: Path, test_csv: Path, out_dir: Path, method: str, seed: int) -> Tuple[Path, Path]:
+def binarize_traits(
+    train_csv: Path,
+    test_csv: Path,
+    out_dir: Path,
+    method: str,
+    seed: int,
+) -> Tuple[Path, Path]:
+    method = str(method).strip().lower()
+    if method not in {"mean", "median", "kmeans"}:
+        raise ValueError(f"METHOD must be one of: mean | median | kmeans. Got: {method}")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     train_df = pd.read_csv(train_csv)
     test_df = pd.read_csv(test_csv)
@@ -277,22 +329,30 @@ def binarize_traits(train_csv: Path, test_csv: Path, out_dir: Path, method: str,
     if missing_te:
         raise ValueError(f"Missing TEST columns: {missing_te}")
 
+    # ✅ ISSUE 13: validate trait constancy within each user (recommended, optional)
+    if VALIDATE_USER_TRAIT_CONSTANCY:
+        _validate_user_trait_constancy(train_df, TRAIT_COLS)
+        _validate_user_trait_constancy(test_df, TRAIT_COLS)
+
     thresholds = compute_thresholds_on_train(train_df, TRAIT_COLS, seed=seed)
     (out_dir / "thresholds_mean_median_kmeans.json").write_text(json.dumps(thresholds, indent=2), encoding="utf-8")
 
     train_out = train_df.copy()
     test_out = test_df.copy()
+
+    # Apply TRAIN-only thresholds row-wise.
+    # This is correct because each sentence row repeats the same self-reported user score.
     for col in TRAIT_COLS:
         tr = _safe_to_float(train_df[col]).to_numpy()
         te = _safe_to_float(test_df[col]).to_numpy()
-        thr = thresholds[col][method]   # use TRAIN-only user-level threshold already computed
+        thr = thresholds[col][method]
         train_out[f"{col}_bin_{method}"] = _binarize_with_threshold(tr, thr)
         test_out[f"{col}_bin_{method}"] = _binarize_with_threshold(te, thr)
 
     train_bin = out_dir / f"train_binarized_{method}.csv"
     test_bin = out_dir / f"test_binarized_{method}.csv"
-    train_out.to_csv(train_bin, index=False)
-    test_out.to_csv(test_bin, index=False)
+    train_out.to_csv(train_bin, index=False, encoding="utf-8")
+    test_out.to_csv(test_bin, index=False, encoding="utf-8")
 
     if MAKE_PLOTS:
         plot_hist_panels(train_df, TRAIT_COLS, thresholds, out_png=out_dir / "hist_panels_train.png")
@@ -335,8 +395,8 @@ def make_train_val_test(trainval_csv: Path, test_csv: Path, train_out: Path, val
     train_df = add_split_columns(df.iloc[sorted(train_idx)].reset_index(drop=True), "train")
     val_df = add_split_columns(df.iloc[sorted(val_idx)].reset_index(drop=True), "val")
 
-    train_df.to_csv(train_out, index=False)
-    val_df.to_csv(val_out, index=False)
+    train_df.to_csv(train_out, index=False, encoding="utf-8")
+    val_df.to_csv(val_out, index=False, encoding="utf-8")
     print("✅ Step C saved:", train_out)
     print("✅ Step C saved:", val_out)
 
@@ -344,7 +404,7 @@ def make_train_val_test(trainval_csv: Path, test_csv: Path, train_out: Path, val
     if USER_COL not in te.columns:
         raise KeyError(f"USER_COL='{USER_COL}' not found in test. Columns: {te.columns.tolist()}")
     te = add_split_columns(te, "test")
-    te.to_csv(test_out, index=False)
+    te.to_csv(test_out, index=False, encoding="utf-8")
     print("✅ Step C saved:", test_out)
 
 
@@ -520,7 +580,7 @@ def preprocess_split_csv(in_csv: Path, out_csv: Path) -> None:
     ensure_nltk()
     slang = load_slang_map(SLANG_CSV)
 
-    # CHECK (loose)
+    # CHECK (loose) - kept for future use
     check_cfg = PipelineConfig(
         keep_punct=True,
         keep_numbers=True,
@@ -546,7 +606,7 @@ def preprocess_split_csv(in_csv: Path, out_csv: Path) -> None:
         paper_stopwords=True,
     )
 
-    sw_check = stopwords_for(check_cfg)
+    # ✅ ISSUE 12 fix: removed dead variable sw_check (was never used)
     sw_strict = stopwords_for(strict_cfg)
 
     raw = df[TEXT_COL_FOR_PREP].fillna("").astype(str)

@@ -167,8 +167,6 @@ def _PMI(seqs: List[str], vocab_map: Dict[str, int], window_size: int, sparse: b
             ids = [vocab_map[t] for t in context if t in vocab_map]
             for a in ids:
                 W_i[a] += 1.0
-                for b in ids:
-                    pass  # keeps loop structure similar to Shine (counts below)
 
             for x in range(len(ids)):
                 ax = ids[x]
