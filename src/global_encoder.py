@@ -136,7 +136,7 @@ class Step2GlobalEncoder(nn.Module):
         dims_in: Dict[str, int],
         hid_dim: int,
         out_dim: int,
-        dropout: float = 0.5,
+        dropout: float = 0.3,
     ) -> None:
         super().__init__()
         self.word = TwoLayerGCN(gcn_layer_cls, dims_in["word"], hid_dim, out_dim, dropout)
@@ -222,6 +222,10 @@ def save_global_embeddings(out_dir: str, gcn_layer_cls: type[nn.Module], hid_dim
         p / "H_views.pt",
     )
     print("Saved:", p / "H_views.pt")
+
+    # Issue 15 fix: also save encoder weights so train_end2end.py can warm-start from them
+    torch.save(enc.state_dict(), p / "global_encoder_pretrained.pt")
+    print("Saved:", p / "global_encoder_pretrained.pt")
 
 
 def sanity_forward(out_dir: str, gcn_layer_cls: type[nn.Module], hid_dim: int = GLOBAL_GCN_DIM, out_dim: int = GLOBAL_GCN_DIM) -> None:

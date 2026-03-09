@@ -249,13 +249,11 @@ class LocalGraphBuilder:
         # -----------------------
         # Lexicon mapping (Empath or LIWC)
         # -----------------------
-        # token -> [cats] where cats may be names ("family") or ids
-        self.lex_token2cats: Dict[str, List[Any]] = {}
-        self.lex_name2id: Optional[Dict[str, int]] = None
+        self.lex_token2cats = {}
+        self.lex_name2id = None
 
-        # Prefer Empath artifacts if present; otherwise fall back to LIWC artifacts.
         empath_map_path = self.outp / "empath_word2cats.json"
-        liwc_map_path = self.outp / "liwc_word2cats.json"
+        liwc_map_path   = self.outp / "liwc_word2cats.json"
 
         if empath_map_path.exists():
             self.lex_token2cats = _load_json(empath_map_path)
@@ -263,16 +261,10 @@ class LocalGraphBuilder:
         elif liwc_map_path.exists():
             self.lex_token2cats = _load_json(liwc_map_path)
             self.lex_kind = "liwc"
-        else:
-            self.lex_kind = "none"
 
-        # Name -> id mapping (only needed when cats are strings)
-        # For Empath, empath_id2_list.json 
-        # For LIWC, liwc_id2_list.json.
-        empath_id2_path = self.outp / "empath_id2_list.json"
-        liwc_id2_path = self.outp / "liwc_id2_list.json"
+        empath_id2_path = self.outp / "empath_id2_list.json"   # correct file for Empath
+        liwc_id2_path   = self.outp / "liwc_id2_list.json"
 
-        id2 = None
         if empath_id2_path.exists():
             id2 = _load_json(empath_id2_path)
         elif liwc_id2_path.exists():

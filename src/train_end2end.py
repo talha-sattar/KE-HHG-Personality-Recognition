@@ -1,29 +1,4 @@
 # file: src/train_end2end.py
-"""
-SHINE-style training loop (max_epoch=1000, early stop on val loss patience=10)
-with TRUE end-to-end trainability of Global Encoder parameters by recomputing H_views
-PER BATCH (no detach), while keeping split isolation (no label leakage) and
-transductive global graphs (built from all docs like SHINE/TextGCN).
-
-Prereqs:
-- Step1 artifacts already exist in OUT_DIR (global_graph_output):
-  adj_word.pkl, adj_tag.pkl, adj_liwc.pkl, adj_entity.pkl, adj_text.pkl
-  word_type_bert_emb.pkl, pos_onehot.pkl, liwc_onehot.pkl, entity_emb.pkl, doc_bert_emb.npy
-  doc_word_seq.jsonl, word_pos_edges.csv, word_entity_edges.csv, liwc_word2cats.json, etc.
-
-This script:
-- Builds local graphs using LocalGraphBuilder (CSV/JSONL artifacts unchanged)
-- Builds local node features using build_X_local_from_Hviews (unchanged)
-- Trains:
-  - Global Encoder parameters W1_tau/W2_tau (trainable, per batch)
-  - local encoder parameters (local GCN)
-  - user self-attention parameters (Wq/Wk/Wv)
-  - classifier parameters
-- Uses 2 LR groups (local faster than global)
-- Logs rich training/validation metrics
-"""
-
-
 from __future__ import annotations
 
 import collections
@@ -31,9 +6,11 @@ import csv
 import json
 import pickle
 import random
+import math
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple, Union, Optional
+from typing import Any, Dict, List, Sequence, Tuple, Union, Optional, Callable
 
 import numpy as np
 import scipy.sparse as sp
@@ -41,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from datetime import datetime
 
 from GCN import GCN
 from local_graph import LocalGraphBuilder, build_X_local_from_Hviews
@@ -50,6 +26,7 @@ try:
     from global_encoder import GLOBAL_GCN_DIM
 except Exception:
     GLOBAL_GCN_DIM = 400
+
 
 USER_COL = "ID_COL"
 TRAIT_NAMES = ["OPEN", "CON", "EXT", "AGR", "NEU"]
@@ -68,20 +45,20 @@ def set_seed(seed: int) -> None:
 
 
 def _f1_per_label(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12):
-    tp = (y_true * y_pred).sum(axis=0)
-    fp = ((1 - y_true) * y_pred).sum(axis=0)
-    fn = (y_true * (1 - y_pred)).sum(axis=0)
+    """Per-label precision, recall, F1. Single unified path — no sklearn dependency.
+    All three returned arrays are guaranteed consistent: 2*p*r/(p+r) == f1.
+    """
+    tp = (y_true * y_pred).sum(axis=0).astype(np.float64)
+    fp = ((1 - y_true) * y_pred).sum(axis=0).astype(np.float64)
+    fn = (y_true * (1 - y_pred)).sum(axis=0).astype(np.float64)
     precision = tp / (tp + fp + eps)
-    recall = tp / (tp + fn + eps)
+    recall    = tp / (tp + fn + eps)
     f1 = 2 * precision * recall / (precision + recall + eps)
-    return precision, recall, f1
+    f1 = np.nan_to_num(f1, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return precision.astype(np.float32), recall.astype(np.float32), f1
 
 
 def label_cols_from_method(method: str) -> List[str]:
-    """
-    ISSUE 2 fix:
-    build label columns dynamically (mean/median/kmeans)
-    """
     m = str(method).strip().lower()
     if m not in {"mean", "median", "kmeans"}:
         raise ValueError(f"Unknown label_method='{method}'. Expected one of: mean, median, kmeans")
@@ -118,56 +95,63 @@ def load_labels_users_aligned(
     rows = _read_csv_rows(csv_path)
     if len(rows) != len(doc_indices):
         raise ValueError(
-            f"Row count mismatch for {Path(csv_path).name}: csv_rows={len(rows)} but split_indices={len(doc_indices)}."
+            f"Row count mismatch for {Path(csv_path).name}: csv_rows={len(rows)} but split_indices={len(doc_indices)}. "
+            f"Ensure CSV has exactly the same rows in the same order as doc_indices."
         )
 
     missing = [c for c in label_cols if c not in rows[0]]
     if missing:
-        raise KeyError(f"{Path(csv_path).name} missing label columns: {missing}.")
+        raise KeyError(f"{Path(csv_path).name} missing label columns: {missing}. Found: {list(rows[0].keys())}")
     if user_col not in rows[0]:
-        raise KeyError(f"{Path(csv_path).name} missing user id column '{user_col}'.")
+        raise KeyError(f"{Path(csv_path).name} missing user id column '{user_col}'. Found: {list(rows[0].keys())}")
 
     labels: Dict[int, np.ndarray] = {}
     users: Dict[int, int] = {}
+    invalid_label_count = 0
 
     for i, doc_idx in enumerate(doc_indices):
         row = rows[i]
-        y = np.array([float(row[c]) for c in label_cols], dtype=np.float32)
+        try:
+            y = np.array([float(row[c]) for c in label_cols], dtype=np.float32)
+        except (ValueError, KeyError) as e:
+            raise ValueError(f"Failed to parse labels for row {i} (doc_idx={doc_idx}): {e}")
+        
+        if not np.isfinite(y).all():
+            invalid_label_count += 1
+            # Skip this row with invalid labels
+            continue
+        
         labels[int(doc_idx)] = y
 
         u_raw = row[user_col]
         try:
             u = int(float(u_raw))
-        except Exception:
+        except (ValueError, TypeError):
+            # Hash string user IDs consistently
             u = abs(hash(u_raw)) % (2**31 - 1)
         users[int(doc_idx)] = u
 
+    if invalid_label_count > 0:
+        print(f"[WARNING] {Path(csv_path).name}: Skipped {invalid_label_count} rows with non-finite labels", flush=True)
+    
+    if len(labels) == 0:
+        raise ValueError(f"No valid labels loaded from {csv_path}")
+    
     return labels, users
 
 
-def compute_class_distribution(labels_dict: Dict[int, np.ndarray]) -> Dict[str, Dict[str, float]]:
-    """Compute class distribution statistics for each trait"""
-    if not labels_dict:
-        return {}
-    
-    labels_array = np.array(list(labels_dict.values()))
-    n_samples = len(labels_array)
-    
-    dist = {}
-    for i, trait in enumerate(TRAIT_NAMES):
-        trait_labels = labels_array[:, i]
-        pos_rate = float((trait_labels > 0.5).mean())
-        neg_rate = 1.0 - pos_rate
-        dist[trait] = {
-            "positive_rate": pos_rate,
-            "negative_rate": neg_rate,
-            "positive_count": int((trait_labels > 0.5).sum()),
-            "negative_count": int((trait_labels <= 0.5).sum()),
-            "mean": float(trait_labels.mean()),
-            "std": float(trait_labels.std())
-        }
-    
-    return dist
+def _safe_item(x: torch.Tensor) -> float:
+    return float(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).item())
+
+
+def compute_pos_rates_from_labels_dict(labels_dict: Dict[int, np.ndarray]) -> np.ndarray:
+    Y = np.stack(list(labels_dict.values()), axis=0).astype(np.float32)
+    return (Y > 0.5).mean(axis=0)
+
+
+def sanity_label_rates_from_dict(labels_dict: Dict[int, np.ndarray], name: str) -> None:
+    rates = compute_pos_rates_from_labels_dict(labels_dict)
+    print(f"[SANITY] {name} label pos-rates: " + ", ".join([f"{TRAIT_NAMES[i]}={rates[i]:.3f}" for i in range(5)]), flush=True)
 
 
 # -------------------------
@@ -229,27 +213,22 @@ def _load_pkl(path: Path) -> Any:
 
 
 def _load_feature(path: Path) -> torch.Tensor:
-    """
-    Robust feature loader: .pkl / .npy -> torch.float32 dense
-    Handles scipy sparse + list/tuple + object arrays.
-    """
+    """Load feature matrix from pickle or npy, handling edge cases."""
     if path.suffix == ".npy":
         obj = np.load(path, allow_pickle=True)
     else:
         obj = _load_pkl(path)
 
     if sp.issparse(obj):
-        return torch.tensor(obj.toarray(), dtype=torch.float32)
-
-    if isinstance(obj, (list, tuple)):
+        result = torch.tensor(obj.toarray(), dtype=torch.float32)
+    elif isinstance(obj, (list, tuple)):
         arr = np.asarray(obj, dtype=object)
         if arr.dtype == object:
             arr = np.stack([np.asarray(x, dtype=np.float32) for x in obj], axis=0)
         else:
             arr = arr.astype(np.float32, copy=False)
-        return torch.tensor(arr, dtype=torch.float32)
-
-    if isinstance(obj, np.ndarray):
+        result = torch.tensor(arr, dtype=torch.float32)
+    elif isinstance(obj, np.ndarray):
         if obj.dtype == object:
             try:
                 arr = obj.astype(np.float32)
@@ -257,14 +236,16 @@ def _load_feature(path: Path) -> torch.Tensor:
                 arr = np.stack([np.asarray(x, dtype=np.float32) for x in obj], axis=0)
         else:
             arr = obj.astype(np.float32, copy=False)
-        return torch.tensor(arr, dtype=torch.float32)
-
-    arr = np.asarray(obj)
-    if arr.dtype == object:
-        arr = arr.astype(np.float32)
+        result = torch.tensor(arr, dtype=torch.float32)
     else:
-        arr = arr.astype(np.float32, copy=False)
-    return torch.tensor(arr, dtype=torch.float32)
+        arr = np.asarray(obj, dtype=np.float32)
+        result = torch.tensor(arr, dtype=torch.float32)
+    
+    # Validate result is 2D
+    if result.dim() != 2:
+        raise RuntimeError(f"Expected 2D feature tensor, got {result.shape} from {path.name}")
+    
+    return result
 
 
 def load_step2_inputs_liwc(
@@ -294,6 +275,7 @@ def load_step2_inputs_liwc(
         liwc_feat = p / "empath_onehot.pkl"
     feat_paths["liwc"] = liwc_feat
 
+    # Validate all files exist
     for k, ap in adj_paths.items():
         if not ap.exists():
             raise FileNotFoundError(f"Missing adjacency for view '{k}': {ap}")
@@ -307,14 +289,23 @@ def load_step2_inputs_liwc(
         if not sp.issparse(A):
             A = sp.coo_matrix(np.asarray(A))
         A_norm[k] = normalize_adj_coo(scipy_to_torch_coo(A))
+        print(f"[LOAD] Adjacency '{k}': shape={tuple(A_norm[k].shape)}, nnz={A_norm[k].coalesce()._nnz()}", flush=True)
 
-    X: Dict[str, torch.Tensor] = {k: _load_feature(fp) for k, fp in feat_paths.items()}
+    X: Dict[str, torch.Tensor] = {}
+    for k, fp in feat_paths.items():
+        X[k] = _load_feature(fp)
+        print(f"[LOAD] Feature '{k}': shape={tuple(X[k].shape)}", flush=True)
 
+    # Validate shapes match
     for k in adj_paths:
         if A_norm[k].shape[0] != X[k].shape[0]:
-            raise ValueError(f"Shape mismatch for '{k}': A {tuple(A_norm[k].shape)} vs X {tuple(X[k].shape)}")
+            raise ValueError(
+                f"Shape mismatch for view '{k}': adjacency {tuple(A_norm[k].shape)} vs feature {tuple(X[k].shape)}. "
+                f"Number of nodes must match."
+            )
 
     dims_in = {k: int(X[k].shape[1]) for k in X}
+    print(f"[LOAD] Feature dimensions: {dims_in}", flush=True)
     return A_norm, X, dims_in
 
 
@@ -337,27 +328,13 @@ class TwoLayerGCN(nn.Module):
 
 
 class GlobalEncoder(nn.Module):
-    def __init__(
-        self,
-        dims_in: Dict[str, int],
-        hid_dim: int = GLOBAL_GCN_DIM,
-        out_dim: int = GLOBAL_GCN_DIM,
-        dropout: float = 0.5,
-    ):
+    def __init__(self, dims_in: Dict[str, int], hid_dim: int = GLOBAL_GCN_DIM, out_dim: int = GLOBAL_GCN_DIM, dropout: float = 0.3):
         super().__init__()
         self.word = TwoLayerGCN(dims_in["word"], hid_dim, out_dim, dropout)
         self.pos = TwoLayerGCN(dims_in["pos"], hid_dim, out_dim, dropout)
         self.liwc = TwoLayerGCN(dims_in["liwc"], hid_dim, out_dim, dropout)
         self.entity = TwoLayerGCN(dims_in["entity"], hid_dim, out_dim, dropout)
         self.text = TwoLayerGCN(dims_in["text"], hid_dim, out_dim, dropout)
-        
-        # Store architecture info
-        self.arch_info = {
-            "input_dims": dims_in,
-            "hidden_dim": hid_dim,
-            "output_dim": out_dim,
-            "dropout": dropout
-        }
 
     def forward(self, A_norm: Dict[str, torch.Tensor], X: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return {
@@ -369,37 +346,68 @@ class GlobalEncoder(nn.Module):
         }
 
 
-def paper_beta(y: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    y = (y > 0.5).float()
-    dots = y @ y.t()
-    denom = dots.sum(dim=1, keepdim=True).clamp_min(eps)
-    return dots / denom
+# -------------------------
+# losses
+# -------------------------
+class BalancedBCELoss(nn.Module):
+    """Standard BCE loss — correct choice for our balanced 50/50 OCEAN data.
+
+    WHY NOT ASL (AsymmetricLoss) for this dataset:
+    ─────────────────────────────────────────────
+    ASL (Ridnik 2021) was designed for SPARSE multi-label data (MS-COCO, ImageNet)
+    where positive labels are rare (~1–10% per class). Its key asymmetry:
+      gamma_pos=1, gamma_neg=2 → negative focal weight is stronger
+
+    On BALANCED data (50/50) this asymmetry is HARMFUL:
+      At p=0.5, balanced batch:
+        Positive gradient: (1-p)^gp / p × p(1-p) = 0.423  (pushes logit UP for y=1)
+        Negative gradient: p_m^gn / (1-p_m) × p(1-p) = 0.227  (pushes logit DOWN for y=0)
+        Net gradient = (−0.423 + 0.227) / 2 = −0.098  → SYSTEMATICALLY increases logit
+
+    ASL's positive gradient is 1.87× stronger than its negative gradient on our data.
+    Result: all logits drift positive within 25 training steps → PosRate=1.0 collapse.
+
+    BCE has perfectly symmetric gradients on balanced data:
+      d(−log p)/d(logit) = −(1−p),   d(−log(1−p))/d(logit) = +p
+      At p=0.5: −0.5 and +0.5 → net gradient = 0 on balanced batch  ✓
+
+    Switch back to ASL only if/when traits become severely imbalanced (pos_rate < 20%).
+    """
+    def __init__(self, pos_weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        # pos_weight allows per-trait re-weighting if imbalance emerges later
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        pw = self.pos_weight
+        if pw is not None:
+            pw = pw.to(logits.device)
+        out = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw)
+        if not torch.isfinite(out):
+            print(f"[BCE WARNING] non-finite loss, returning 0. "
+                  f"logit range=[{logits.min().item():.2f}, {logits.max().item():.2f}]",
+                  flush=True)
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        return out
 
 
-def paper_contrastive_loss(x_user: torch.Tensor, y: torch.Tensor, theta: float = 10.0, eps: float = 1e-12) -> torch.Tensor:
-    B = int(x_user.shape[0])
-    if B <= 1:
-        return torch.zeros((), dtype=x_user.dtype, device=x_user.device)
-    dist = torch.cdist(x_user, x_user, p=2)
-    logits = -dist / max(float(theta), eps)
-    log_p = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    beta = paper_beta(y, eps=eps).to(x_user.device)
-    return -(beta * log_p).sum() / float(B)
+class UserLevelAggregator(nn.Module):
+    def forward(self, z: torch.Tensor, user_ids: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        unique_users = torch.unique(user_ids, sorted=True)
+        agg_z, agg_y = [], []
+        for uid in unique_users:
+            mask = user_ids == uid
+            agg_z.append(z[mask].mean(dim=0))
+            agg_y.append((y[mask].mean(dim=0) >= 0.5).float())
+        return torch.stack(agg_z, dim=0), torch.stack(agg_y, dim=0)
 
 
 class LocalGCNEncoder(nn.Module):
-    def __init__(self, in_dim: int, hid_dim: int = 400, out_dim: int = 400, dropout: float = 0.5):
+    def __init__(self, in_dim: int, hid_dim: int = 400, out_dim: int = 400, dropout: float = 0.3):
         super().__init__()
         self.g1 = GCN(in_dim, hid_dim)
         self.g2 = GCN(hid_dim, out_dim)
         self.dropout = float(dropout)
-        
-        self.arch_info = {
-            "input_dim": in_dim,
-            "hidden_dim": hid_dim,
-            "output_dim": out_dim,
-            "dropout": dropout
-        }
 
     def forward(self, adj_norm: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         h = self.g1(adj_norm, x)
@@ -409,76 +417,93 @@ class LocalGCNEncoder(nn.Module):
 
 
 class UserSelfAttention(nn.Module):
+    """Scaled dot-product attention with a same-user bias.
+
+    same_user_bias adds a fixed value to attention logits for posts from the
+    same user, so they attend more to each other.
+
+    CAUTION on same_user_bias magnitude:
+      With 32 posts/batch (16 users × 2), bias=5.0 gives same-user attention
+      weight ≈ 83% — the model almost completely ignores cross-user context.
+      bias=2.0 gives ≈ 20%, keeping meaningful cross-user attention.
+      Default changed from 5.0 → 2.0.  Override via SAME_USER_BIAS env var.
+    """
     def __init__(self, dim: int):
         super().__init__()
-        self.q = nn.Linear(dim, dim, bias=False)
-        self.k = nn.Linear(dim, dim, bias=False)
-        self.v = nn.Linear(dim, dim, bias=False)
+        self.q     = nn.Linear(dim, dim, bias=False)
+        self.k     = nn.Linear(dim, dim, bias=False)
+        self.v     = nn.Linear(dim, dim, bias=False)
         self.scale = dim ** 0.5
-        
-        self.arch_info = {
-            "dim": dim,
-            "scale": float(self.scale)
-        }
 
     @staticmethod
     def build_S(user_ids: torch.Tensor) -> torch.Tensor:
         uid = user_ids.view(-1, 1)
         return (uid == uid.t()).float()
 
-    def forward(self, x: torch.Tensor, user_ids: torch.Tensor, same_user_bias: float = 5.0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, user_ids: torch.Tensor,
+                same_user_bias: float = 2.0) -> torch.Tensor:
         Q = self.q(x)
         K = self.k(x)
         V = self.v(x)
         logits = (Q @ K.t()) / self.scale
-        S = self.build_S(user_ids).to(logits.device)
+        S      = self.build_S(user_ids).to(logits.device)
         logits = logits + float(same_user_bias) * S
-        A = F.softmax(logits, dim=1)
+        A      = F.softmax(logits, dim=1)
         return A @ V
 
 
 class Step3Model(nn.Module):
-    def __init__(self, in_dim: int, hid_dim: int = 400, out_dim: int = 400, dropout: float = 0.5, num_labels: int = 5):
-        super().__init__()
-        self.enc = LocalGCNEncoder(in_dim, hid_dim=hid_dim, out_dim=out_dim, dropout=dropout)
-        self.user_attn = UserSelfAttention(out_dim)
-        self.cls = nn.Linear(out_dim, num_labels)
-        
-        self.arch_info = {
-            "local_encoder": self.enc.arch_info,
-            "attention": self.user_attn.arch_info,
-            "classifier": {
-                "input_dim": out_dim,
-                "output_dim": num_labels
-            }
-        }
+    """Local GCN → user self-attention → LayerNorm → classifier.
 
-    def forward(
-        self,
-        adj_norm: torch.Tensor,
-        x: torch.Tensor,
-        post_node_index: torch.Tensor,
-        user_ids: torch.Tensor,
-        same_user_bias: float = 5.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.enc(adj_norm, x)
-        z = h[post_node_index]
-        z_user = self.user_attn(z, user_ids, same_user_bias=same_user_bias)
+    WHY LayerNorm before cls:
+      The GCN uses ReLU activations, so all intermediate features are >= 0.
+      After user-level attention pooling, z_user is a non-negative vector.
+      A random linear classifier applied to a non-negative input produces
+      logits that are biased positive (half positive, half negative weights,
+      but all-positive inputs → positive dot products dominate).
+      This causes PosRate≈1.0 from step 1, before any learning.
+
+      LayerNorm centres and scales z_user to mean=0, std=1 per sample,
+      which ensures the classifier sees zero-mean input at initialisation,
+      giving P(logit>0) ≈ 0.5 per label — the correct starting point.
+    """
+    def __init__(self, in_dim: int, hid_dim: int = 400, out_dim: int = 400,
+                 dropout: float = 0.3, num_labels: int = 5):
+        super().__init__()
+        self.enc       = LocalGCNEncoder(in_dim, hid_dim=hid_dim, out_dim=out_dim, dropout=dropout)
+        self.user_attn = UserSelfAttention(out_dim)
+        self.norm      = nn.LayerNorm(out_dim)   # ← centres ReLU-biased embeddings
+        self.cls       = nn.Linear(out_dim, num_labels)
+
+    def forward(self, adj_norm: torch.Tensor, x: torch.Tensor,
+                post_node_index: torch.Tensor, user_ids: torch.Tensor,
+                same_user_bias: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        h       = self.enc(adj_norm, x)
+        z       = h[post_node_index]
+        z_user  = self.user_attn(z, user_ids, same_user_bias=same_user_bias)
+        z_user  = self.norm(z_user)              # normalise before classifier
         return self.cls(z_user), z_user
+
+    def cls_only(self, z_user: torch.Tensor) -> torch.Tensor:
+        # Always re-normalise before cls: mean(LN(x1),LN(x2)) has std≈0.707,
+        # not 1.0 — the aggregation undoes part of the LayerNorm scaling.
+        return self.cls(self.norm(z_user))
+
+
+def init_classifier_bias_from_priors(model: Step3Model, train_labels: Dict[int, np.ndarray]) -> None:
+    priors = compute_pos_rates_from_labels_dict(train_labels)
+    priors = np.clip(priors, 1e-4, 1 - 1e-4)
+    bias = np.log(priors / (1 - priors)).astype(np.float32)
+    with torch.no_grad():
+        model.cls.bias.copy_(torch.tensor(bias, device=model.cls.bias.device))
+    print("[init] cls.bias=logit(train_priors): " + ", ".join([f"{TRAIT_NAMES[i]}={bias[i]:+.3f}" for i in range(5)]), flush=True)
 
 
 # -------------------------
 # data
 # -------------------------
 class UserBatchSampler(torch.utils.data.Sampler[List[int]]):
-    """
-    Samples batches by grouping multiple docs per user so contrastive loss has positives.
-
-    __len__ improved by estimating number of "chunks" per user (ceil(n_docs_u/n_per_user)),
-    then estimating batches as ceil(total_chunks / users_per_batch).
-    """
-
-    def __init__(self, doc_indices, users, batch_size, n_per_user=4, shuffle=True):
+    def __init__(self, doc_indices, users, batch_size, n_per_user=2, shuffle=True):
         self.batch_size = int(batch_size)
         self.n_per_user = int(max(1, n_per_user))
         self.shuffle = bool(shuffle)
@@ -514,7 +539,6 @@ class UserBatchSampler(torch.utils.data.Sampler[List[int]]):
                 yield batch
 
     def __len__(self) -> int:
-        # chunk-based estimate (much closer to reality than ceil(total_docs/batch_size))
         users_per_batch = max(1, self.batch_size // self.n_per_user)
         total_chunks = 0
         for idxs in self.user_to_idx.values():
@@ -539,34 +563,24 @@ class SplitDocDataset(Dataset):
 
 
 def _get_post_lid(nodes: Any) -> int:
-    # First find the post/text/doc node
     post_node = None
     for n in nodes:
-        # Safe attribute retrieval without 'or' chaining
         ntype = None
         for attr in ("ntype", "type", "node_type"):
             v = getattr(n, attr, None)
             if v is not None:
                 ntype = v
                 break
-                
         if ntype in ("post", "text", "doc"):
             post_node = n
             break
-    
     if post_node is None:
-        raise RuntimeError(
-            f"No post/text/doc node found. Node types present: "
-            f"{[getattr(n, 'ntype', '?') for n in nodes]}"
-        )
-    
-    # Get local_id - explicitly check each attribute, don't use 'or' chaining
+        raise RuntimeError("No post/text/doc node found in local graph nodes.")
     for attr in ("local_id", "local", "lid", "id"):
         lid = getattr(post_node, attr, None)
         if lid is not None:
             return int(lid)
-    
-    raise RuntimeError(f"Post node has no local_id attribute. Available: {dir(post_node)}")
+    raise RuntimeError("Post node has no local_id/local/lid/id attribute.")
 
 
 @dataclass
@@ -579,30 +593,20 @@ class Batched:
     post_node_index: torch.Tensor
 
 
-def make_loader(
-    out_dir: Union[str, Path],
+def make_collate_fn(
+    *,
     split: str,
     labels: Dict[int, np.ndarray],
     users: Dict[int, int],
-    builder: LocalGraphBuilder,
     global_encoder: GlobalEncoder,
     A_norm: Dict[str, torch.Tensor],
     X: Dict[str, torch.Tensor],
     device: torch.device,
-    batch_size: int,
-    shuffle: bool,
-    h_views_cache: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> DataLoader:
-    ds = SplitDocDataset(out_dir, split=split, builder=builder)
-
+    H_views_override: Optional[Dict[str, torch.Tensor]] = None,
+) -> Callable[[List[Dict[str, Any]]], Batched]:
     def collate_fn(items: List[Dict[str, Any]]) -> Batched:
-        # Cache only when no_grad (eval). Never cache during train because autograd graph can't be reused across batches.
-        if (not torch.is_grad_enabled()) and (h_views_cache is not None) and ("H" in h_views_cache):
-            H_views = h_views_cache["H"].get("views")
-            if H_views is None:
-                H_views = global_encoder(A_norm, X)
-                h_views_cache["H"]["views"] = H_views
-        else:
+        H_views = H_views_override
+        if H_views is None:
             H_views = global_encoder(A_norm, X)
 
         doc_ids: List[int] = []
@@ -643,266 +647,104 @@ def make_loader(
 
         return Batched(doc_idx=doc_t, user_id=user_t, y=yb, x=Xb, adj_norm=Ab, post_node_index=post_t)
 
-    sampler = UserBatchSampler(
-        ds.doc_indices,
-        users,
-        batch_size=batch_size,
-        n_per_user=max(1, batch_size // 4),
-        shuffle=shuffle,
-    )
-    return DataLoader(ds, batch_sampler=sampler, num_workers=0, collate_fn=collate_fn)
+    return collate_fn
 
 
 # -------------------------
-# eval
+# metrics
 # -------------------------
 @torch.no_grad()
-def evaluate(
-    model: Step3Model,
-    global_encoder: GlobalEncoder,
+def compute_f1_metrics(logits: torch.Tensor, y: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
+    """Compute F1 metrics at sentence/batch level. Returns consistent dict."""
+    probs = torch.sigmoid(logits)
+    probs = torch.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
+    
+    y_np = y.detach().cpu().numpy().astype(np.int32)
+    y_pred = (probs >= threshold).float().detach().cpu().numpy().astype(np.int32)
+    
+    _, _, f1_per_trait = _f1_per_label(y_np, y_pred)
+    
+    return {
+        "macro_f1": float(f1_per_trait.mean()),
+        "f1_open": float(f1_per_trait[0]),
+        "f1_con": float(f1_per_trait[1]),
+        "f1_ext": float(f1_per_trait[2]),
+        "f1_agr": float(f1_per_trait[3]),
+        "f1_neu": float(f1_per_trait[4]),
+        "pos_rate": float((probs >= threshold).float().mean().item()),
+        "true_rate": float(y.float().mean().item()),
+    }
+
+
+@torch.no_grad()
+def metrics_from_logits(logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
+    """DEPRECATED: Use compute_f1_metrics instead. Kept for backwards compatibility."""
+    return compute_f1_metrics(logits, y, threshold=0.5)
+
+
+@torch.no_grad()
+def run_eval(
+    *,
     loader: DataLoader,
-    theta: float,
-    lam: float,
+    model: Step3Model,
+    bce: BalancedBCELoss,
+    agg: UserLevelAggregator,
     same_user_bias: float,
 ) -> Dict[str, float]:
-    # BUG 2 fix: toggle BOTH modules
-    model_was_training = model.training
-    global_was_training = global_encoder.training
-
-    model.eval()
-    global_encoder.eval()
-
-    bce = nn.BCEWithLogitsLoss()
-    total = total_bce = total_cl = 0.0
-    n_batches = 0
+    """Evaluate model on user-level aggregated predictions."""
+    tot_loss = tot_bce = 0.0
+    nb = 0
     logits_all: List[torch.Tensor] = []
     y_all: List[torch.Tensor] = []
 
     for b in loader:
-        logits, z = model(b.adj_norm, b.x, b.post_node_index, b.user_id, same_user_bias=same_user_bias)
-        y = b.y
+        # Forward pass at sentence level
+        logits_sent, z_sent = model(b.adj_norm, b.x, b.post_node_index, b.user_id, same_user_bias=same_user_bias)
+        
+        # Aggregate to user level
+        z_user, y_user = agg(z_sent, b.user_id, b.y)
+        logits_user = model.cls_only(z_user)
 
-        logits_all.append(logits.detach().cpu())
-        y_all.append(y.detach().cpu())
+        # Compute losses at user level
+        l_bce = bce(logits_user, y_user)
+        loss = l_bce
 
-        l_b = bce(logits, y)
-        l_c = paper_contrastive_loss(z, y, theta=theta)
-        loss = l_b + lam * l_c
+        # Accumulate
+        tot_loss += _safe_item(loss)
+        tot_bce += _safe_item(l_bce)
+        nb += 1
 
-        total += float(loss.item())
-        total_bce += float(l_b.item())
-        total_cl += float(l_c.item())
-        n_batches += 1
+        logits_all.append(logits_user.detach().cpu())
+        y_all.append(y_user.detach().cpu())
 
-    probs = torch.sigmoid(torch.cat(logits_all, dim=0)).numpy()
-    y_true = torch.cat(y_all, dim=0).numpy().astype(np.int32)
-    y_pred = (probs >= 0.5).astype(np.int32)
-
-    _, _, f1 = _f1_per_label(y_true, y_pred)
-
-    out = {
-        "loss": total / max(n_batches, 1),
-        "bce": total_bce / max(n_batches, 1),
-        "cl": total_cl / max(n_batches, 1),
-        "macro_f1": float(f1.mean()),
-    }
-    for i, name in enumerate(TRAIT_NAMES):
-        out[f"f1_{name}"] = float(f1[i])
-
-    # restore modes
-    model.train(model_was_training)
-    global_encoder.train(global_was_training)
+    # Compute metrics on all accumulated user-level predictions
+    if logits_all:
+        logits_combined = torch.cat(logits_all, dim=0)
+        y_combined = torch.cat(y_all, dim=0)
+        
+        probs = torch.sigmoid(logits_combined).numpy()
+        y_true = y_combined.numpy().astype(np.int32)
+        y_pred = (probs >= 0.5).astype(np.int32)
+        
+        _, _, f1_per_trait = _f1_per_label(y_true, y_pred)
+        
+        out = {
+            "loss": tot_loss / max(nb, 1),
+            "bce": tot_bce / max(nb, 1),
+            "macro_f1": float(np.clip(f1_per_trait.mean(), 0.0, 1.0)),
+        }
+        for i, name in enumerate(TRAIT_NAMES):
+            out[f"f1_{name}"] = float(np.clip(f1_per_trait[i], 0.0, 1.0))
+    else:
+        out = {
+            "loss": 0.0,
+            "bce": 0.0,
+            "macro_f1": 0.0,
+        }
+        for name in TRAIT_NAMES:
+            out[f"f1_{name}"] = 0.0
+    
     return out
-
-
-# -------------------------
-# grad stats
-# -------------------------
-def grad_mean_abs(module: nn.Module) -> float:
-    tot = 0.0
-    n = 0
-    for p in module.parameters():
-        if p.grad is None:
-            continue
-        tot += float(p.grad.detach().abs().mean().cpu())
-        n += 1
-    return tot / max(n, 1)
-
-
-def grad_l2_norm(module: nn.Module) -> float:
-    total_sq = 0.0
-    for p in module.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad.detach()
-        total_sq += float((g * g).sum().item())
-    return total_sq ** 0.5
-
-
-@torch.no_grad()
-def batch_metrics_from_logits(logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
-    probs = torch.sigmoid(logits)
-    y_pred = (probs >= 0.5).float()
-
-    y_np = y.detach().cpu().numpy().astype(np.int32)
-    y_pred_np = y_pred.detach().cpu().numpy().astype(np.int32)
-
-    _, _, f1 = _f1_per_label(y_np, y_pred_np)
-    return {
-        "macro_f1": float(f1.mean()),
-        "prob_mean": float(probs.mean().item()),
-        "prob_std": float(probs.std(unbiased=False).item()),
-        "pred_pos_rate": float(y_pred.mean().item()),
-        "true_pos_rate": float(y.mean().item()),
-    }
-
-
-# -------------------------
-# initial logging
-# -------------------------
-def log_initial_info(
-    out_dir: str,
-    train_csv: str,
-    val_csv: str,
-    test_csv: str,
-    label_method: str,
-    max_epochs: int,
-    patience: int,
-    lr_local: float,
-    lr_global: float,
-    weight_decay: float,
-    use_scheduler: bool,
-    scheduler_eta_min: float,
-    batch_size: int,
-    theta: float,
-    lam: float,
-    same_user_bias: float,
-    global_gcn_dim: int,
-    train_labels: Dict[int, np.ndarray],
-    val_labels: Dict[int, np.ndarray],
-    test_labels: Dict[int, np.ndarray],
-    train_users: Dict[int, int],
-    val_users: Dict[int, int],
-    test_users: Dict[int, int],
-    A_norm: Dict[str, torch.Tensor],
-    X: Dict[str, torch.Tensor],
-    dims_in: Dict[str, int],
-    global_encoder: GlobalEncoder,
-    model: Step3Model,
-    device: torch.device,
-) -> None:
-    """Log comprehensive initial information about data, models, and hyperparameters"""
-    
-    print("\n" + "="*80)
-    print(f"SHINE END-TO-END TRAINING INITIALIZATION")
-    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*80)
-    
-    # Paths
-    print(f"\n[Paths]")
-    print(f"  Output directory: {out_dir}")
-    print(f"  Train CSV: {train_csv}")
-    print(f"  Validation CSV: {val_csv}")
-    print(f"  Test CSV: {test_csv}")
-    print(f"  Label method: {label_method}")
-    
-    # Device info
-    print(f"\n[Device]")
-    print(f"  Using device: {device}")
-    if device.type == 'cuda':
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    
-    # Data splits info
-    print(f"\n[Data Splits]")
-    print(f"  Train: {len(train_labels)} documents, {len(set(train_users.values()))} unique users")
-    print(f"  Validation: {len(val_labels)} documents, {len(set(val_users.values()))} unique users")
-    print(f"  Test: {len(test_labels)} documents, {len(set(test_users.values()))} unique users")
-    
-    # Class distribution - Train
-    print(f"\n[Class Distribution - Train Set]")
-    train_dist = compute_class_distribution(train_labels)
-    for trait, stats in train_dist.items():
-        print(f"  {trait}:")
-        print(f"    Positive rate: {stats['positive_rate']:.4f} ({stats['positive_count']}/{stats['positive_count'] + stats['negative_count']})")
-        print(f"    Mean: {stats['mean']:.4f}, Std: {stats['std']:.4f}")
-    
-    # Class distribution - Validation
-    print(f"\n[Class Distribution - Validation Set]")
-    val_dist = compute_class_distribution(val_labels)
-    for trait, stats in val_dist.items():
-        print(f"  {trait}:")
-        print(f"    Positive rate: {stats['positive_rate']:.4f} ({stats['positive_count']}/{stats['positive_count'] + stats['negative_count']})")
-        print(f"    Mean: {stats['mean']:.4f}, Std: {stats['std']:.4f}")
-    
-    # Class distribution - Test
-    print(f"\n[Class Distribution - Test Set]")
-    test_dist = compute_class_distribution(test_labels)
-    for trait, stats in test_dist.items():
-        print(f"  {trait}:")
-        print(f"    Positive rate: {stats['positive_rate']:.4f} ({stats['positive_count']}/{stats['positive_count'] + stats['negative_count']})")
-        print(f"    Mean: {stats['mean']:.4f}, Std: {stats['std']:.4f}")
-    
-    # Global graph info
-    print(f"\n[Global Graphs]")
-    for view_name in A_norm.keys():
-        adj = A_norm[view_name]
-        feat = X[view_name]
-        # Safe nnz calculation
-        if adj.is_sparse:
-            nnz = int(adj._nnz())
-        else:
-            nnz = int((adj != 0).sum().item())
-        print(f"  {view_name.capitalize()}:")
-        print(f"    Adjacency: {adj.shape[0]} nodes, {nnz} edges")
-        print(f"    Features: {feat.shape[0]} nodes, {feat.shape[1]} dims")
-    
-    # Global encoder architecture
-    print(f"\n[Global Encoder]")
-    for view_name, in_dim in dims_in.items():
-        print(f"  {view_name.capitalize()} GCN: {in_dim} -> {global_gcn_dim} -> {global_gcn_dim} (dropout=0.5)")
-    
-    # Local model architecture
-    print(f"\n[Local Model]")
-    print(f"  Local GCN Encoder:")
-    print(f"    Input dim: {model.enc.arch_info['input_dim']}")
-    print(f"    Hidden dim: {model.enc.arch_info['hidden_dim']}")
-    print(f"    Output dim: {model.enc.arch_info['output_dim']}")
-    print(f"    Dropout: {model.enc.arch_info['dropout']}")
-    print(f"  User Self-Attention:")
-    print(f"    Dim: {model.user_attn.arch_info['dim']}")
-    print(f"    Scale: {model.user_attn.arch_info['scale']:.2f}")
-    print(f"  Classifier:")
-    print(f"    Input dim: {model.cls.in_features}, Output dim: {model.cls.out_features}")
-    
-    # Parameter counts
-    global_params = sum(p.numel() for p in global_encoder.parameters())
-    local_params = sum(p.numel() for p in model.parameters())
-    print(f"\n[Model Parameters]")
-    print(f"  Global encoder: {global_params:,} trainable parameters")
-    print(f"  Local model: {local_params:,} trainable parameters")
-    print(f"  Total: {global_params + local_params:,} trainable parameters")
-    
-    # Hyperparameters
-    print(f"\n[Hyperparameters]")
-    print(f"  Training:")
-    print(f"    Max epochs: {max_epochs}")
-    print(f"    Early stopping patience: {patience}")
-    print(f"    Batch size: {batch_size}")
-    print(f"    Label method: {label_method}")
-    print(f"  Optimization:")
-    print(f"    Learning rate (local): {lr_local:.2e}")
-    print(f"    Learning rate (global): {lr_global:.2e}")
-    print(f"    Weight decay: {weight_decay:.2e}")
-    print(f"    Use scheduler: {use_scheduler}")
-    if use_scheduler:
-        print(f"    Scheduler eta min: {scheduler_eta_min:.2e}")
-    print(f"  Loss functions:")
-    print(f"    Contrastive loss theta: {theta:.2f}")
-    print(f"    Contrastive loss lambda: {lam:.4f}")
-    print(f"    Same user bias: {same_user_bias:.2f}")
-    
-    print("\n" + "="*80 + "\n")
 
 
 # -------------------------
@@ -915,35 +757,57 @@ def train(
     test_csv: str,
     *,
     seed: int = 1,
-    label_method: str = "mean",  
+    label_method: str = "mean",
     max_epochs: int = 1000,
-    patience: int = 10,
+    patience: int = 25,
     lr_local: float = 1e-4,
-    lr_global: float = 2e-5,
-    weight_decay: float = 5e-4,  
-    use_scheduler: bool = True,  
-    scheduler_eta_min: float = 1e-6, 
+    lr_global: float = 1e-5,   # 10× lower than lr_local: global encoder on 53k-node graphs
+    weight_decay: float = 5e-4,
+    use_scheduler: bool = True,
+    scheduler_eta_min: float = 1e-6,
     batch_size: int = 32,
-    theta: float = 10.0,
-    lam: float = 0.01,
-    same_user_bias: float = 5.0,
+    same_user_bias: float = 2.0,    # reduced from 5.0: see UserSelfAttention note
     grad_print_every: int = 25,
     max_grad_norm: float = 1.0,
-    global_gcn_dim: int = GLOBAL_GCN_DIM,  
+    global_gcn_dim: int = GLOBAL_GCN_DIM,
+    n_per_user: int = 2,
+    local_dropout: float = 0.3,
+    smooth_k: int = 3,  # rolling average window
 ) -> None:
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     outp = Path(out_dir)
-
     label_cols = label_cols_from_method(label_method)
-
-    train_idx = load_split_doc_indices(outp, "train")
-    val_idx = load_split_doc_indices(outp, "val")
-    test_idx = load_split_doc_indices(outp, "test")
-
-    train_labels, train_users = load_labels_users_aligned(train_csv, train_idx, label_cols=label_cols)
-    val_labels, val_users = load_labels_users_aligned(val_csv, val_idx, label_cols=label_cols)
-    test_labels, test_users = load_labels_users_aligned(test_csv, test_idx, label_cols=label_cols)
+    
+    # ====== VALIDATION: Check all files exist ======
+    for path_str, name in [(train_csv, "TRAIN_CSV"), (val_csv, "VAL_CSV"), (test_csv, "TEST_CSV")]:
+        p = Path(path_str)
+        if not p.exists():
+            raise FileNotFoundError(f"{name} not found: {path_str}")
+    
+    if not outp.exists():
+        raise FileNotFoundError(f"Output directory not found: {out_dir}")
+    
+    # ====== VALIDATION: Load indices ======
+    try:
+        train_idx = load_split_doc_indices(outp, "train")
+        val_idx = load_split_doc_indices(outp, "val")
+        test_idx = load_split_doc_indices(outp, "test")
+        print(f"[VALIDATION] Loaded split indices: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}", flush=True)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load split indices from {outp}: {e}")
+    
+    # ====== VALIDATION: Load and align data ======
+    try:
+        train_labels, train_users = load_labels_users_aligned(train_csv, train_idx, label_cols=label_cols)
+        val_labels, val_users = load_labels_users_aligned(val_csv, val_idx, label_cols=label_cols)
+        test_labels, test_users = load_labels_users_aligned(test_csv, test_idx, label_cols=label_cols)
+        print(f"[VALIDATION] Labels loaded: train={len(train_labels)}, val={len(val_labels)}, test={len(test_labels)}", flush=True)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load labels: {e}")
+    
+    if len(train_labels) == 0 or len(val_labels) == 0 or len(test_labels) == 0:
+        raise RuntimeError("Empty label dictionary detected after loading")
 
     builder = LocalGraphBuilder(outp, entity_col="entity_lid", lru_cache_size=2000)
 
@@ -951,37 +815,67 @@ def train(
     A_norm = {k: v.to(device) for k, v in A_norm.items()}
     X = {k: v.to(device) for k, v in X.items()}
 
-    global_encoder = GlobalEncoder(dims_in, hid_dim=global_gcn_dim, out_dim=global_gcn_dim).to(device)
-    global_encoder.train()
+    # global_encoder dropout set to 0.0:
+    # TwoLayerGCN has dropout INSIDE the encoder (between GCN layers).
+    # When dropout > 0, H_views in training mode differ from eval mode
+    # (train: 30% features zeroed + scaled 1.43×; eval: full features).
+    # The local model trains on train-mode H_views → catastrophic mismatch at val.
+    # Setting dropout=0 makes H_views IDENTICAL in train and eval → gap disappears.
+    # Regularisation for the global encoder comes from weight decay (wd=5e-4).
+    global_encoder = GlobalEncoder(dims_in, hid_dim=global_gcn_dim, out_dim=global_gcn_dim, dropout=0.0).to(device)
 
-    # Build one batch to infer local feature dimension
-    tmp_loader = make_loader(
-        outp,
-        "train",
-        train_labels,
-        train_users,
-        builder,
-        global_encoder,
-        A_norm,
-        X,
-        device,
-        batch_size=1,
-        shuffle=False,
+    # warm-start
+    _pretrained_path = outp / "global_encoder_pretrained.pt"
+    if _pretrained_path.exists():
+        _ckpt = torch.load(str(_pretrained_path), map_location=device)
+        global_encoder.load_state_dict(_ckpt, strict=False)
+        print(f"[warm-start] Loaded global encoder weights from {_pretrained_path.name}", flush=True)
+    else:
+        print(f"[warm-start] No pretrained checkpoint found at {_pretrained_path.name} — training from scratch", flush=True)
+
+    # infer local in_dim
+    global_encoder.train()
+    tmp_ds = SplitDocDataset(outp, "train", builder)
+    tmp_sampler = UserBatchSampler(tmp_ds.doc_indices, train_users, batch_size=1, n_per_user=1, shuffle=False)
+    tmp_loader = DataLoader(
+        tmp_ds,
+        batch_sampler=tmp_sampler,
+        num_workers=0,
+        collate_fn=make_collate_fn(
+            split="train",
+            labels=train_labels,
+            users=train_users,
+            global_encoder=global_encoder,
+            A_norm=A_norm,
+            X=X,
+            device=device,
+            H_views_override=None,
+        ),
     )
     tmp_batch = next(iter(tmp_loader))
-    model = Step3Model(in_dim=int(tmp_batch.x.shape[1]), num_labels=len(TRAIT_NAMES)).to(device)
-    
-    # Log initial information
-    log_initial_info(
-        out_dir, train_csv, val_csv, test_csv,
-        label_method, max_epochs, patience, lr_local, lr_global,
-        weight_decay, use_scheduler, scheduler_eta_min, batch_size,
-        theta, lam, same_user_bias, global_gcn_dim,
-        train_labels, val_labels, test_labels,
-        train_users, val_users, test_users,
-        A_norm, X, dims_in,
-        global_encoder, model, device
-    )
+
+    model = Step3Model(in_dim=int(tmp_batch.x.shape[1]), num_labels=len(TRAIT_NAMES), dropout=local_dropout).to(device)
+    init_classifier_bias_from_priors(model, train_labels)
+
+    print("\n" + "=" * 80)
+    print("SHINE END-TO-END TRAINING INITIALIZATION")
+    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+    if device.type == "cuda":
+        print(f"[Device] cuda | {torch.cuda.get_device_name(0)} | {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB")
+    else:
+        print("[Device] cpu")
+    print(f"[Splits] train_docs={len(train_labels)} val_docs={len(val_labels)} test_docs={len(test_labels)}")
+    print(f"[Batch] docs={batch_size} n_per_user={n_per_user} approx_users/batch={max(1, batch_size//max(1,n_per_user))}")
+    print(f"[Dropout] local_dropout={local_dropout} global_dropout=0.0 (zero to eliminate train/val H_views mismatch)")
+    print(f"[Loss] BCE(balanced) — SupCon removed")
+    print(f"[Opt] lr_local={lr_local:.1e} lr_global={lr_global:.1e} (10× lower) wd={weight_decay:.1e}")
+    print(f"[Attn] same_user_bias={same_user_bias} (2.0=default; 5.0 makes model ignore cross-user context)")
+    print("=" * 80 + "\n", flush=True)
+
+    sanity_label_rates_from_dict(train_labels, "TRAIN")
+    sanity_label_rates_from_dict(val_labels, "VAL")
+    sanity_label_rates_from_dict(test_labels, "TEST")
 
     opt = torch.optim.AdamW(
         [
@@ -989,71 +883,68 @@ def train(
             {"params": global_encoder.parameters(), "lr": lr_global, "weight_decay": weight_decay},
         ]
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs, eta_min=float(scheduler_eta_min)) if use_scheduler else None
 
-    scheduler = None
-    if use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=max_epochs, eta_min=float(scheduler_eta_min)
-        )
+    bce_loss = BalancedBCELoss()
+    agg_train = UserLevelAggregator()
+    agg_eval  = UserLevelAggregator()
 
-    bce = nn.BCEWithLogitsLoss()
+    # datasets created once (avoid JSON re-reads)
+    train_ds = SplitDocDataset(outp, "train", builder)
+    val_ds = SplitDocDataset(outp, "val", builder)
+    test_ds = SplitDocDataset(outp, "test", builder)
 
-    # Eval caches
-    val_hcache: Dict[str, Dict[str, Any]] = {"H": {"views": None}}
-    test_hcache: Dict[str, Dict[str, Any]] = {"H": {"views": None}}
-
-    train_loader = make_loader(
-        outp,
-        "train",
-        train_labels,
-        train_users,
-        builder,
-        global_encoder,
-        A_norm,
-        X,
-        device,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-    val_loader = make_loader(
-        outp,
-        "val",
-        val_labels,
-        val_users,
-        builder,
-        global_encoder,
-        A_norm,
-        X,
-        device,
-        batch_size=batch_size,
-        shuffle=False,
-        h_views_cache=val_hcache,
-    )
-    test_loader = make_loader(
-        outp,
-        "test",
-        test_labels,
-        test_users,
-        builder,
-        global_encoder,
-        A_norm,
-        X,
-        device,
-        batch_size=batch_size,
-        shuffle=False,
-        h_views_cache=test_hcache,
-    )
+    train_sampler = UserBatchSampler(train_ds.doc_indices, train_users, batch_size=batch_size, n_per_user=n_per_user, shuffle=True)
+    val_sampler   = UserBatchSampler(val_ds.doc_indices,   val_users,   batch_size=batch_size, n_per_user=n_per_user, shuffle=False)
+    test_sampler  = UserBatchSampler(test_ds.doc_indices,  test_users,  batch_size=batch_size, n_per_user=n_per_user, shuffle=False)
 
     best_val = float("inf")
     bad = 0
     best_path = outp / "end2end_shine_best.pt"
     step = 0
 
+    recent_val: List[float] = []
+
     for ep in range(1, max_epochs + 1):
         model.train()
         global_encoder.train()
 
-        total = total_b = total_c = 0.0
+        # ── Cache H_views ONCE per epoch ────────────────────────────────────
+        # Previously H_views_override=None meant global_encoder was called
+        # every batch (217× per epoch), each time with SLIGHTLY different
+        # weights (because opt.step() ran between calls).  The local model
+        # trained on 217 different H_views within one epoch, then faced yet
+        # another H_views at epoch N+1 start → the loss spike pattern.
+        #
+        # Fix: compute H_views once, freeze for the entire epoch.  Effects:
+        #   • H_views are CONSISTENT within each epoch (no intra-epoch drift)
+        #   • Training is ~217× faster for the global encoder forward pass
+        #   • Epoch-start spike eliminated (local model only adjusts once/epoch)
+        #   • Train and val now use identically-structured cached H_views
+        with torch.no_grad():
+            H_views_train = global_encoder(A_norm, X)
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=UserBatchSampler(
+                train_ds.doc_indices, train_users,
+                batch_size=batch_size, n_per_user=n_per_user, shuffle=True,
+            ),
+            num_workers=0,
+            collate_fn=make_collate_fn(
+                split="train",
+                labels=train_labels,
+                users=train_users,
+                global_encoder=global_encoder,
+                A_norm=A_norm,
+                X=X,
+                device=device,
+                H_views_override=H_views_train,   # ← cached, consistent
+            ),
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
+        total = total_b = 0.0
         n_batches = 0
         train_logits_all: List[torch.Tensor] = []
         train_y_all: List[torch.Tensor] = []
@@ -1062,154 +953,157 @@ def train(
             step += 1
             opt.zero_grad(set_to_none=True)
 
-            logits, z = model(
-                b.adj_norm,
-                b.x,
-                b.post_node_index,
-                b.user_id,
-                same_user_bias=same_user_bias,
-            )
-            y = b.y
+            logits_sent, z_sent = model(b.adj_norm, b.x, b.post_node_index, b.user_id, same_user_bias=same_user_bias)
+            z_user, y_user = agg_train(z_sent, b.user_id, b.y)
+            logits_user = model.cls_only(z_user)
 
-            l_b = bce(logits, y)
-            l_c = paper_contrastive_loss(z, y, theta=theta)
-            loss = l_b + lam * l_c
+            l_b = bce_loss(logits_user, y_user)
+            loss = torch.nan_to_num(l_b, nan=0.0, posinf=0.0, neginf=0.0)
 
             loss.backward()
-
-            # gradient clipping
             if max_grad_norm is not None and max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     list(model.parameters()) + list(global_encoder.parameters()),
                     max_norm=float(max_grad_norm),
                 )
 
-            g_mean_global = grad_mean_abs(global_encoder)
-            g_mean_local = grad_mean_abs(model)
-            g_norm_global = grad_l2_norm(global_encoder)
-            g_norm_local = grad_l2_norm(model)
-
-            batch_stats = batch_metrics_from_logits(logits, y)
-
             opt.step()
 
-            total += float(loss.item())
-            total_b += float(l_b.item())
-            total_c += float(l_c.item())
+            total += _safe_item(loss)
+            total_b += _safe_item(l_b)
             n_batches += 1
 
-            train_logits_all.append(logits.detach().cpu())
-            train_y_all.append(y.detach().cpu())
+            train_logits_all.append(logits_user.detach().cpu())
+            train_y_all.append(y_user.detach().cpu())
 
             if step % grad_print_every == 0:
-                lr_local_now = opt.param_groups[0]["lr"]
+                stats         = compute_f1_metrics(logits_user, y_user, threshold=0.5)
+                lr_local_now  = opt.param_groups[0]["lr"]
                 lr_global_now = opt.param_groups[1]["lr"]
-                
-                # Get actual batch size
-                B = int(b.y.shape[0])
-
-                avg_loss = total / max(n_batches, 1)
-                avg_bce = total_b / max(n_batches, 1)
-                avg_cl = total_c / max(n_batches, 1)
-
+                # With LayerNorm+correct ASL, PosRate should never reach 1.0.
+                # If this flag appears, check model architecture changes.
+                collapse_flag = "  [!COLLAPSE — check BCE/LayerNorm]" if stats["pos_rate"] >= 0.95 else ""
                 print(
-                    f"[TRAIN] "
-                    f"Epoch={ep:03d}/{max_epochs:03d} "
-                    f"Batch={bi:04d}/{len(train_loader):04d} "
-                    f"Step={step:06d} | "
-                    f"B={B:02d} | "
-                    f"Loss={loss.item():.4f} (Avg={avg_loss:.4f}) | "
-                    f"BCE={l_b.item():.4f} (Avg={avg_bce:.4f}) | "
-                    f"CL={l_c.item():.4f} (Avg={avg_cl:.4f}) | "
-                    f"MacroF1={batch_stats['macro_f1']:.4f} | "
-                    f"Prob(μ={batch_stats['prob_mean']:.4f}, σ={batch_stats['prob_std']:.4f}) | "
-                    f"PosRate(Pred={batch_stats['pred_pos_rate']:.4f}, True={batch_stats['true_pos_rate']:.4f}) | "
-                    f"Grad(Global/Local) μ_abs=({g_mean_global:.3e}/{g_mean_local:.3e}) L2=({g_norm_global:.3e}/{g_norm_local:.3e}) | "
-                    f"LR(Global/Local)=({lr_global_now:.2e}/{lr_local_now:.2e})",
+                    f"[TRAIN] Ep={ep:03d} Batch={bi:04d}/{len(train_loader):04d} Step={step:06d} | "
+                    f"B={int(y_user.shape[0]):02d} | "
+                    f"Loss(avg)={total/max(n_batches,1):.4f} "
+                    f"BCE(avg)={total_b/max(n_batches,1):.4f} "
+                    f"MacroF1={stats['macro_f1']:.4f} | "
+                    f"PosRate={stats['pos_rate']:.4f} TrueRate={stats['true_rate']:.4f}"
+                    f"{collapse_flag} | "
+                    f"LR(L/G)=({lr_local_now:.2e}/{lr_global_now:.2e})",
                     flush=True,
                 )
 
-        tr_loss = total / max(n_batches, 1)
-        tr_b = total_b / max(n_batches, 1)
-        tr_c = total_c / max(n_batches, 1)
+        # ── epoch-level train metrics (user-level, full epoch) ───────────────
+        train_probs     = torch.sigmoid(torch.cat(train_logits_all, dim=0)).numpy()
+        train_true      = torch.cat(train_y_all, dim=0).numpy().astype(np.int32)
+        train_pred      = (train_probs >= 0.5).astype(np.int32)
+        _, _, train_f1s = _f1_per_label(train_true, train_pred)
+        train_macro_f1  = float(train_f1s.mean())
 
-        train_probs = torch.sigmoid(torch.cat(train_logits_all, dim=0)).numpy()
-        train_true = torch.cat(train_y_all, dim=0).numpy().astype(np.int32)
-        train_pred = (train_probs >= 0.5).astype(np.int32)
-        _, _, train_f1 = _f1_per_label(train_true, train_pred)
-        train_macro_f1 = float(train_f1.mean())
+        # ── eval (val only; test evaluated ONCE at end on best checkpoint) ───
+        # Previously a test_loader was rebuilt here every epoch and never used —
+        # that wasted one full global-encoder GCN pass per epoch.
+        model.eval()
+        global_encoder.eval()
 
-        # reset eval cache so val uses current encoder weights
-        val_hcache["H"]["views"] = None
-        va = evaluate(model, global_encoder, val_loader, theta=theta, lam=lam, same_user_bias=same_user_bias)
+        with torch.no_grad():
+            H_views_eval = global_encoder(A_norm, X)
 
-        # scheduler step after validation
+        val_loader = DataLoader(
+            val_ds,
+            batch_sampler=val_sampler,
+            num_workers=0,
+            collate_fn=make_collate_fn(
+                split="val",
+                labels=val_labels,
+                users=val_users,
+                global_encoder=global_encoder,
+                A_norm=A_norm,
+                X=X,
+                device=device,
+                H_views_override=H_views_eval,
+            ),
+        )
+
+        va = run_eval(
+            loader=val_loader, model=model,
+            bce=bce_loss, agg=agg_eval,
+            same_user_bias=same_user_bias,
+        )
+
+        model.train()
+        global_encoder.train()
+
         if scheduler is not None:
             scheduler.step()
 
+        recent_val.append(float(va["loss"]))
+        smoothed = float(np.mean(recent_val[-max(1, int(smooth_k)):]))
+
         print(
-            f"[EPOCH] Epoch={ep:03d}/{max_epochs:03d} | "
-            f"Train: Loss={tr_loss:.4f} BCE={tr_b:.4f} CL={tr_c:.4f} MacroF1={train_macro_f1:.4f} | "
-            f"Valid: Loss={va['loss']:.4f} BCE={va['bce']:.4f} CL={va['cl']:.4f} MacroF1={va['macro_f1']:.4f} | "
-            f"F1(OPEN={va['f1_OPEN']:.4f}, CON={va['f1_CON']:.4f}, EXT={va['f1_EXT']:.4f}, "
-            f"AGR={va['f1_AGR']:.4f}, NEU={va['f1_NEU']:.4f})",
+            f"[EPOCH] Ep={ep:03d} | "
+            f"Train Loss={total/max(n_batches,1):.4f} "
+            f"MacroF1={train_macro_f1:.4f} "
+            f"F1(O={train_f1s[0]:.3f} C={train_f1s[1]:.3f} E={train_f1s[2]:.3f} "
+            f"A={train_f1s[3]:.3f} N={train_f1s[4]:.3f}) | "
+            f"Val Loss={va['loss']:.4f} (smooth{smooth_k}={smoothed:.4f}) "
+            f"MacroF1={va['macro_f1']:.4f} "
+            f"F1(O={va['f1_OPEN']:.3f} C={va['f1_CON']:.3f} E={va['f1_EXT']:.3f} "
+            f"A={va['f1_AGR']:.3f} N={va['f1_NEU']:.3f})",
             flush=True,
         )
 
-        if va["loss"] + 1e-9 < best_val:
-            prev_best = best_val
-            best_val = va["loss"]
+        if math.isfinite(smoothed) and (smoothed + 1e-9 < best_val):
+            prev = best_val
+            best_val = smoothed
             bad = 0
             torch.save(
-                {
-                    "local": model.state_dict(),
-                    "global": global_encoder.state_dict(),
-                    "epoch": ep,
-                    "best_val": best_val,
-                    "best_val_macroF1": va["macro_f1"],
-                    "label_method": label_method,
-                    "global_gcn_dim": global_gcn_dim,
-                },
+                {"local": model.state_dict(), "global": global_encoder.state_dict(), "epoch": ep, "best_val_smooth": best_val, "best_val_raw": float(va["loss"])},
                 best_path,
             )
-            print(
-                f"[CHECKPOINT] Epoch={ep:03d} NEW BEST | "
-                f"Val Loss: {prev_best:.4f} → {best_val:.4f} | "
-                f"Val MacroF1={va['macro_f1']:.4f} | "
-                f"Saved to {best_path.name}",
-                flush=True,
-            )
+            print(f"[CHECKPOINT] Ep={ep:03d} NEW BEST | smooth_val {prev:.4f}->{best_val:.4f} saved {best_path.name}", flush=True)
         else:
             bad += 1
-            print(
-                f"[CHECKPOINT] Epoch={ep:03d} No improvement | "
-                f"Best Val Loss={best_val:.4f} | "
-                f"Patience {bad}/{patience}",
-                flush=True,
-            )
+            print(f"[CHECKPOINT] Ep={ep:03d} no improve | best_smooth={best_val:.4f} patience {bad}/{patience}", flush=True)
             if bad >= patience:
-                print(
-                    f"[EARLY STOP] Stopped at epoch {ep:03d} | "
-                    f"Best Val Loss={best_val:.4f} | "
-                    f"Patience={patience}",
-                    flush=True,
-                )
+                print(f"[EARLY STOP] stopped at ep={ep:03d} best_smooth_val={best_val:.4f}", flush=True)
                 break
 
     print(f"\n[DONE] Best checkpoint: {best_path}", flush=True)
 
+    # final test
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["local"])
     global_encoder.load_state_dict(ckpt["global"])
 
-    test_hcache["H"]["views"] = None
-    te = evaluate(model, global_encoder, test_loader, theta=theta, lam=lam, same_user_bias=same_user_bias)
+    model.eval()
+    global_encoder.eval()
+
+    with torch.no_grad():
+        H_views_eval = global_encoder(A_norm, X)
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_sampler=test_sampler,
+        num_workers=0,
+        collate_fn=make_collate_fn(
+            split="test",
+            labels=test_labels,
+            users=test_users,
+            global_encoder=global_encoder,
+            A_norm=A_norm,
+            X=X,
+            device=device,
+            H_views_override=H_views_eval,
+        ),
+    )
+
+    te = run_eval(loader=test_loader, model=model, bce=bce_loss, agg=agg_eval, same_user_bias=same_user_bias)
     print(
-        f"\n[TEST] Final Results | "
-        f"Loss={te['loss']:.4f} BCE={te['bce']:.4f} CL={te['cl']:.4f} "
-        f"MacroF1={te['macro_f1']:.4f} | "
-        f"F1(OPEN={te['f1_OPEN']:.4f}, CON={te['f1_CON']:.4f}, EXT={te['f1_EXT']:.4f}, "
-        f"AGR={te['f1_AGR']:.4f}, NEU={te['f1_NEU']:.4f})",
+        f"\n[TEST] Loss={te['loss']:.4f} MacroF1={te['macro_f1']:.4f} | "
+        f"F1(OPEN={te['f1_OPEN']:.4f}, CON={te['f1_CON']:.4f}, EXT={te['f1_EXT']:.4f}, AGR={te['f1_AGR']:.4f}, NEU={te['f1_NEU']:.4f})",
         flush=True,
     )
 
@@ -1218,16 +1112,15 @@ if __name__ == "__main__":
     import os
 
     ROOT = Path(__file__).resolve().parent
-
     OUT_DIR_DEFAULT = ROOT / "outputs" / "global_graph_output"
     DATA_PROCESSED_DEFAULT = ROOT / "data" / "processed" / "preprocess_check_out"
 
-    OUT_DIR = Path(os.getenv("GLOBAL_GRAPH_OUT", str(OUT_DIR_DEFAULT)))
+    OUT_DIR       = Path(os.getenv("GLOBAL_GRAPH_OUT", str(OUT_DIR_DEFAULT)))
     DATA_PROCESSED = Path(os.getenv("DATA_PROCESSED", str(DATA_PROCESSED_DEFAULT)))
 
     TRAIN_CSV = Path(os.getenv("TRAIN_CSV", str(DATA_PROCESSED / "final_train_preprocessed.csv")))
-    VAL_CSV = Path(os.getenv("VAL_CSV", str(DATA_PROCESSED / "final_val_preprocessed.csv")))
-    TEST_CSV = Path(os.getenv("TEST_CSV", str(DATA_PROCESSED / "final_test_preprocessed.csv")))
+    VAL_CSV   = Path(os.getenv("VAL_CSV",   str(DATA_PROCESSED / "final_val_preprocessed.csv")))
+    TEST_CSV  = Path(os.getenv("TEST_CSV",  str(DATA_PROCESSED / "final_test_preprocessed.csv")))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1236,20 +1129,21 @@ if __name__ == "__main__":
         train_csv=str(TRAIN_CSV),
         val_csv=str(VAL_CSV),
         test_csv=str(TEST_CSV),
-        seed=1,
+        seed=int(os.getenv("SEED", "1")),
         label_method=os.getenv("LABEL_METHOD", "mean"),
         max_epochs=int(os.getenv("MAX_EPOCHS", "1000")),
-        patience=int(os.getenv("PATIENCE", "10")),
+        patience=int(os.getenv("PATIENCE", "25")),
         lr_local=float(os.getenv("LR_LOCAL", "1e-4")),
-        lr_global=float(os.getenv("LR_GLOBAL", "2e-5")),
+        lr_global=float(os.getenv("LR_GLOBAL", "1e-5")),
         weight_decay=float(os.getenv("WEIGHT_DECAY", "5e-4")),
         batch_size=int(os.getenv("BATCH_SIZE", "32")),
-        theta=float(os.getenv("THETA", "10.0")),
-        lam=float(os.getenv("LAMBDA", "0.01")),
-        same_user_bias=float(os.getenv("SAME_USER_BIAS", "5.0")),
+        same_user_bias=float(os.getenv("SAME_USER_BIAS", "2.0")),
         grad_print_every=int(os.getenv("GRAD_PRINT_EVERY", "25")),
         use_scheduler=os.getenv("USE_SCHEDULER", "1") not in {"0", "false", "False"},
         scheduler_eta_min=float(os.getenv("SCHED_ETA_MIN", "1e-6")),
         max_grad_norm=float(os.getenv("MAX_GRAD_NORM", "1.0")),
         global_gcn_dim=int(os.getenv("GLOBAL_GCN_DIM", str(GLOBAL_GCN_DIM))),
+        n_per_user=int(os.getenv("N_PER_USER", "2")),
+        local_dropout=float(os.getenv("LOCAL_DROPOUT", "0.3")),
+        smooth_k=int(os.getenv("SMOOTH_K", "3")),
     )
